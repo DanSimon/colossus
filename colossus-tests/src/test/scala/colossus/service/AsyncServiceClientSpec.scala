@@ -15,15 +15,13 @@ import Callback.Implicits._
 import akka.util.ByteString
 import RawProtocol._
 
-class AsyncServiceClientSpec extends ColossusSpec {
+class FutureClientSpec extends ColossusSpec {
 
   def makeServer()(implicit sys: IOSystem): ServerRef = {
-    Service.serve[Raw]("redis-test", TEST_PORT){_.handle{_.become{
-      case x => x
-    }}}
+    Service.basic[Raw]("future-client-test", TEST_PORT){case x => x}
   }
 
-  "AsyncServiceClient" must {
+  "FutureClient" must {
     "send a command" in {
       withIOSystem{ implicit io =>
         withServer(makeServer()) {
@@ -49,17 +47,56 @@ class AsyncServiceClientSpec extends ColossusSpec {
           val client = TestClient(io, TEST_PORT)
           Await.result(client.connectionStatus, 100.milliseconds) must equal(ConnectionStatus.Connected)
           client.disconnect()
-          TestClient.waitForStatus(client, ConnectionStatus.NotConnected)
           TestUtil.expectServerConnections(server, 0)
+          TestClient.waitForStatus(client, ConnectionStatus.NotConnected)
         }
       }
     }
 
-    "shutdown when connection is unbound" in {
-      var client: Option[AsyncServiceClient[ByteString, ByteString]] = None
+    "properly fail requests after disconnected" in {
       withIOSystem{ implicit io =>
         withServer(makeServer()) {
-          client = Some(TestClient(io, TEST_PORT, connectionAttempts = PollingDuration.NoRetry))
+          val client = TestClient(io, TEST_PORT)
+          client.disconnect()
+          val toolate = client.send(ByteString("bar"))
+          intercept[ServiceClientException] {
+            Await.result(toolate, 500.milliseconds)
+          }
+        }
+      }
+
+    }
+
+    "allow graceful disconnect" in {
+      withIOSystem{ implicit io =>
+        withServer(makeServer()) {
+          val client = TestClient(io, TEST_PORT)
+          val future = client.send(ByteString("foo"))
+          client.disconnect()
+          val toolate = client.send(ByteString("bar"))
+          Await.result(future, 500.milliseconds) must equal(ByteString("foo"))
+          intercept[ServiceClientException] {
+            Await.result(toolate, 500.milliseconds)
+          }
+        }
+      }
+    }
+
+    "properly buffer messages before workeritem bound" in {
+      withIOSystem{ implicit io =>
+        val client = TestClient(io, TEST_PORT, waitForConnected = false)
+        intercept[NotConnectedException] {
+          Await.result(client.send(ByteString("foo")), 500.milliseconds)
+        }
+      }
+    }
+
+
+    "shutdown when connection is unbound" in {
+      var client: Option[FutureClient[Raw]] = None
+      withIOSystem{ implicit io =>
+        withServer(makeServer()) {
+          client = Some(TestClient(io, TEST_PORT, connectRetry = NoRetry))
           Await.result(client.get.send(ByteString("foo")), 500.milliseconds) must equal(ByteString("foo"))
         }
         TestClient.waitForStatus(client.get, ConnectionStatus.NotConnected)

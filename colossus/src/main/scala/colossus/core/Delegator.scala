@@ -1,7 +1,6 @@
 package colossus
 package core
 
-import akka.actor._
 import akka.event.Logging
 import java.nio.channels.SocketChannel
 
@@ -22,9 +21,15 @@ import scala.util.Try
  *  @param server reference to the server
  *  @param worker reference to the worker this delegator belongs to
  */
-abstract class Delegator(val server: ServerRef, val worker: WorkerRef) {
+abstract class Delegator(val server: ServerRef,  _worker: WorkerRef) {
+
+  //this is so users can do import context.worker
+  implicit val worker = _worker
+
   val log = Logging(worker.system.actorSystem, s"${server.name}-delegator-${worker.id}")
+
   implicit val executor = server.system.actorSystem.dispatcher
+
 
   /**
    * Function which determines whether or not to accept a connection.
@@ -58,18 +63,5 @@ abstract class Delegator(val server: ServerRef, val worker: WorkerRef) {
 
 object Delegator {
   type Factory = (ServerRef, WorkerRef) => Delegator
-
-  def basic(acceptor: () => ServerConnectionHandler): Factory = {(s,w) => new Delegator(s,w){
-    protected def acceptNewConnection = Some(acceptor())
-  }}
-}
-
-/**
- * Currently unused; but will eventually be for async delegators, if we decide to allow them
- */
-sealed trait DelegatorCommand
-object DelegatorCommand {
-  case class Reject(sock: SocketChannel) extends DelegatorCommand
-  case class Register(server: ActorRef, sock: SocketChannel, handler: ConnectionHandler) extends DelegatorCommand
 
 }

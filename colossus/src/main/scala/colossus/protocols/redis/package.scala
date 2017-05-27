@@ -1,60 +1,32 @@
 package colossus
 package protocols
 
-import colossus.parsing.DataSize
-import core.WorkerRef
-import service._
-
 import akka.util.{ByteString, ByteStringBuilder}
-import scala.util.{Success, Failure}
-import Codec._
+import colossus.service._
+
 
 package object redis {
 
-  trait Redis extends CodecDSL {
+  trait Redis extends Protocol {
     type Input = Command
     type Output = Reply
   }
 
-  implicit object RedisCodecProvider extends CodecProvider[Redis] {
-    def provideCodec() = new RedisServerCodec
+  object Redis extends ClientFactories[Redis, RedisClient]{
+    object defaults {
 
-    def errorResponse(request: Command, reason: Throwable) = ErrorReply(s"Error (${reason.getClass.getName}): ${reason.getMessage}")
-  }
+      implicit val redisServerDefaults = new ServiceCodecProvider[Redis] {
+        def provideCodec() = new RedisServerCodec
+        def errorResponse(error: ProcessingFailure[Command]) = ErrorReply(s"Error (${error.reason.getClass.getName}): ${error.reason.getMessage}")
+      }
 
-  implicit object RedisClientCodecProvider extends ClientCodecProvider[Redis] {
-    def clientCodec() = new RedisClientCodec
-    val name = "redis"
-  }
-
-  class RedisClient(config: ClientConfig, worker: WorkerRef, maxSize : DataSize = RedisReplyParser.DefaultMaxSize) extends ServiceClient(
-    codec     = new RedisClientCodec(maxSize),
-    config    = config,
-    worker    = worker
-  ) {
-    import UnifiedProtocol._
-    def info: Callback[Map[String, String]] = send(Command(CMD_INFO)).mapTry{_.flatMap{
-      case BulkReply(data) => Success(InfoParser(data.utf8String))
-      case other => Failure(new Error("Invalid response type"))
-    }}
-  }
-
-  object InfoParser {
-    def apply(infoString: String) = infoString.split("\n")
-      .collect{case s if(s.contains(":")) => s.split(":")}
-      .map{case items => (items(0), items(1).trim)}
-      .toMap    
+      implicit val redisClientDefaults = new ClientCodecProvider[Redis] {
+        def clientCodec() = new RedisClientCodec
+        val name = "redis"
+      }
+    }
 
   }
-
-
-  implicit object RedisServerCodecFactory extends ServerCodecFactory[Command, Reply] {
-    def apply() = new RedisServerCodec
-  }
-  implicit object RedisClientCodecFactory extends ClientCodecFactory[Command, Reply] {
-    def apply() = new RedisClientCodec
-  }
-
 
   object UnifiedBuilder {
 
@@ -67,7 +39,6 @@ package object redis {
       builder append data
       builder append RN
     }
-
   }
 }
 

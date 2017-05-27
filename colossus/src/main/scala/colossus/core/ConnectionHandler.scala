@@ -4,6 +4,17 @@ package core
 import akka.actor.ActorRef
 import scala.concurrent.duration._
 
+
+sealed trait MoreDataResult
+object MoreDataResult {
+
+  //the handler has no more data at the moment to write
+  case object Complete extends MoreDataResult
+
+  //the handler has more data to write as soon as it can
+  case object Incomplete extends MoreDataResult
+}
+
 /**
  * This is the base trait for all connection handlers.  When attached to a
  * connection by a Delegator, these methods will be called in the worker's
@@ -44,14 +55,11 @@ trait ConnectionHandler extends WorkerItem {
   protected def connectionLost(cause : DisconnectError)
 
 
-  /**
-   * This function is called to signal to the handler that it can resume writing data.
-   * It is called as part of the WriteEndPoint event loop write cycle, where previously this handler
-   * attempted to write data, but the buffers were filled up.  This is called once the buffers
-   * are empty again and able to receive data.  This handler should be in a state where it is paused on writing
-   * data until this handler is invoked.
+  /*
+   * This event allows handlers to write data to the connection.  The output
+   * buffer is limited in size so handlers must properly deal with backpressure.
    */
-  def readyForData()
+  def readyForData(buffer: DataOutBuffer) : MoreDataResult
 
   /**
    * This handler is called when a Worker new Connection is established.  A Connection can be
@@ -61,36 +69,19 @@ trait ConnectionHandler extends WorkerItem {
    */
   def connected(endpoint: WriteEndpoint)
 
-  /**
-   * Called periodically on every attached connection handler, this can be used
-   * for checking if an ongoing operation has timed out.
-   *
-   * Be aware that this is totally independant of a connection's idle timeout,
-   * which is only based on the last time there was any I/O.
-   *
-   * @param period the frequency at which this method is called.  Currently this is hardcoded to `WorkerManager.IdleCheckFrequency`, but may become application dependent in the future.
-   */
-  def idleCheck(period: Duration)
+
 }
+
+
 
 /**
  * Mixin containing events just for server connection handlers
  */
-trait ServerConnectionHandler extends ConnectionHandler {
-
-  /**
-   * The server is beginning to shutdown and is signaling to the connection
-   * that it should cleanup and terminate.  This gives the connection time to
-   * gracefully shutdown, however eventually the server will timeout and
-   * forcefully close the connection
-   */
-  def shutdownRequest()
-
-}
+trait ServerConnectionHandler extends ConnectionHandler {}
 
 
 /**
- * ClientConnectionHandler is a trait meant to be used with outgoing connections.  
+ * ClientConnectionHandler is a trait meant to be used with outgoing connections.
  */
 trait ClientConnectionHandler extends ConnectionHandler {
 
@@ -124,17 +115,13 @@ trait WatchedHandler extends ConnectionHandler {
  * the necessary functions.  This allows for a devloper to extend this trait and only provide definitions
  * for the functions they require.
  */
-trait BasicSyncHandler extends ConnectionHandler {
+abstract class BasicSyncHandler(context: Context) extends WorkerItem(context) with ConnectionHandler {
+
+  def this(serverContext: ServerContext) = this(serverContext.context)
+
   private var _endpoint: Option[WriteEndpoint] = None
   def endpoint = _endpoint.getOrElse{
     throw new Exception("Handler is not connected")
-  }
-  private var _worker: Option[WorkerRef] = None
-  def worker = _worker.getOrElse{
-    throw new Exception("Handler is not bound to a worker")
-  }
-  def bound(id: Long, worker: WorkerRef) {
-    _worker = Some(worker)
   }
   def connected(e: WriteEndpoint) {
     _endpoint = Some(e)
@@ -146,8 +133,11 @@ trait BasicSyncHandler extends ConnectionHandler {
     _endpoint = None
   }
   def receivedMessage(message: Any, sender: ActorRef){}
-  def readyForData(){}
+  def readyForData(out: DataOutBuffer): MoreDataResult = MoreDataResult.Complete
   def idleCheck(period: Duration){}
+  override def shutdownRequest (){
+    endpoint.disconnect()
+  }
 
   //this is the only method you have to implement
   //def receivedData(data: DataBuffer)

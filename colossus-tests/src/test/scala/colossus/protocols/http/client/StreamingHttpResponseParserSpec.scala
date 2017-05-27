@@ -2,7 +2,7 @@ package colossus.protocols.http.client
 
 import akka.util.ByteString
 import colossus.controller._
-import colossus.core.{DataBuffer, DataReader, DataStream}
+import colossus.core.{DataBuffer, DataReader, DataStream, DynamicOutBuffer}
 import colossus.protocols.http._
 import colossus.service.{Callback, DecodedResult}
 import colossus.testkit.{CallbackMatchers, ColossusSpec, FakeIOSystem, PipeFoldTester}
@@ -15,6 +15,7 @@ class StreamingHttpResponseParserSpec extends ColossusSpec with MustMatchers wit
   implicit val cbe = FakeIOSystem.testExecutor
 
   implicit val duration = 1.second
+  import HttpHeader.Conversions._
 
   "StreamingHttpResponseParser" must {
 
@@ -31,11 +32,12 @@ class StreamingHttpResponseParserSpec extends ColossusSpec with MustMatchers wit
 
       val clientProtocol = new StreamingHttpClientCodec()
 
-      val bytes = sent.encode()
+      val bytes = DataBuffer(sent.bytes)
       val decodedResponse: Option[DecodedResult[StreamingHttpResponse]] = clientProtocol.decode(bytes)
 
       decodedResponse match {
         case Some(DecodedResult.Stream(res, s)) => {
+          println(bytes.remaining)
           s.push(bytes) match {
             case PushResult.Full(trig) => trig.fill{() => s.push(bytes)}
             case _ => throw new Exception("wrong result")
@@ -146,7 +148,7 @@ class StreamingHttpResponseParserSpec extends ColossusSpec with MustMatchers wit
 
   private def validateEncodedStreamingHttpResponse(body : Option[ByteString]){
     val res = StreamingHttpResponse(
-      HttpResponseHead(HttpVersion.`1.1`, HttpCodes.OK, Vector("a"->"b", "content-length"->body.map{_.size.toString}.getOrElse("0"))), 
+      HttpResponseHead(HttpVersion.`1.1`, HttpCodes.OK, Vector("a"->"b", "content-length"->body.map{_.size.toString}.getOrElse("0"))),
       body.map{bod => Source.one(DataBuffer(bod))}
     )
     val clientProtocol = new StreamingHttpClientCodec

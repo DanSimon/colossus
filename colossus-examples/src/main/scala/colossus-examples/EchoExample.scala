@@ -3,36 +3,32 @@ package colossus.examples
 import colossus.IOSystem
 import colossus.core._
 
+import akka.util.ByteString
+
 /*
  * The BasicSyncHandler is a ConnectionHandler that has has default
  * implementations for most of the methods.  It also stores the WriteEndpoint
  * that is passed in the connected method.
  */
-class EchoHandler extends BasicSyncHandler with ServerConnectionHandler {
+class EchoHandler(context: ServerContext) extends BasicSyncHandler(context.context) with ServerConnectionHandler {
+  var bytes = ByteString()
   def receivedData(data: DataBuffer){
-    endpoint.write(data)
+    bytes = ByteString(data.takeAll)
+    endpoint.requestWrite()
   }
 
-  def shutdownRequest(){}
-}
-
-class EchoDelegator(server: ServerRef, worker: WorkerRef) extends Delegator(server, worker) {
-
-  def acceptNewConnection = Some(new EchoHandler)
+  override def readyForData(buffer: DataOutBuffer) = {
+    buffer.write(bytes)
+    MoreDataResult.Complete
+  }
 }
 
 object EchoExample {
 
   def start(port: Int)(implicit io: IOSystem): ServerRef = {
-    val echoConfig = ServerConfig(
-      name = "echo",
-      settings = ServerSettings(
-        port = port
-      ),
-      delegatorFactory = (server, worker) => new EchoDelegator(server, worker)
-    )
-    Server(echoConfig)
-  
+
+    Server.basic("echo", port)(new EchoHandler(_))
+
   }
 
 }

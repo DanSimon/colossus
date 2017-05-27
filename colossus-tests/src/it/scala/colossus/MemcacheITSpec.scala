@@ -3,15 +3,21 @@ package colossus
 import java.net.InetSocketAddress
 
 import akka.util.ByteString
-import colossus.protocols.memcache.MemcacheCommand._
+import colossus.metrics.MetricSystem
+import colossus.protocols.memcache._
 import colossus.protocols.memcache.MemcacheReply._
-import colossus.protocols.memcache.{Memcache, MemcacheCommand, MemcacheReply, MemcachedKey}
-import colossus.service.{AsyncServiceClient, ClientConfig}
+import colossus.protocols.memcache.{MemcacheCommand, MemcacheReply}
+import colossus.service.{FutureClient, ClientConfig}
 import colossus.testkit.ColossusSpec
 import org.scalatest.concurrent.ScalaFutures
+import org.scalatest.time.{Millis, Seconds, Span}
 
-import scala.concurrent.Future
+import scala.collection.mutable
+import scala.concurrent.{Await, Future}
 import scala.concurrent.duration._
+
+import Memcache.defaults._
+
 /*
 Please be aware when running this test, that if you run it on a machine with a memcached server
 running on 11211, it will begin to interact with it.  Be mindful if you are running this on a server
@@ -21,172 +27,222 @@ a Memcached client, which communicates with memcached
  */
 class MemcacheITSpec extends ColossusSpec with ScalaFutures{
 
-  type AsyncMemacheClient = AsyncServiceClient[MemcacheCommand, MemcacheReply]
+  type AsyncMemacheClient = FutureClient[Memcache]
 
-  implicit val sys = IOSystem("test-system", 2)
+  implicit val defaultPatience = PatienceConfig(timeout = Span(2, Seconds), interval = Span(50, Millis))
 
-  import scala.concurrent.ExecutionContext.Implicits.global
+  implicit val sys = IOSystem("test-system", Some(2), MetricSystem.deadSystem)
 
-  val client = AsyncServiceClient[Memcache](ClientConfig(new InetSocketAddress("localhost", 11211), 1.second, "memcache"))
+  val client = Memcache.futureClient(ClientConfig(new InetSocketAddress("localhost", 11211), 2.seconds, "memcache"))
+
+  val usedKeys = scala.collection.mutable.HashSet[ByteString]()
+
+  implicit val ec = sys.actorSystem.dispatcher
+
+  override def afterAll() {
+    val f: Future[mutable.HashSet[Boolean]] = Future.sequence(usedKeys.map(client.delete))
+    f.futureValue must be (mutable.HashSet(true, false)) //some keys are deleted by the tests.
+    super.afterAll()
+  }
 
   val mValue = ByteString("value")
   "Memcached client" should {
     "add" in {
-      val key = ByteString("colITAdd")
-      add(client, key, mValue).futureValue must be (true)
-      get(client, key).futureValue must be (Map("colITAdd"->Value("colITAdd", mValue, 0)))
-      add(client, key, mValue).futureValue must be (false)
+      val key = getKey("colITAdd")
+      val res = for {
+        x <- client.add(key, mValue)
+        y <- client.get(key)
+        z <- client.add(key, mValue)
+      } yield {
+          (x,y,z)
+        }
+
+      res.futureValue must be ((true, Some(Value(ByteString("colITAdd"), mValue, 0)), false))
     }
 
     "append" in {
-      val key = ByteString("colITAppend")
-      append(client, key, ByteString("valueA")).futureValue must be (false)
-      add(client, key, mValue).futureValue must be (true)
-      append(client, key, ByteString("valueA")).futureValue must be (true)
-      get(client, key).futureValue must be (Map("colITAppend"->Value("colITAppend", ByteString("valuevalueA"), 0)))
+      val key = getKey("colITAppend")
+      val res = for {
+        w <- client.append(key, ByteString("valueA"))
+        x <- client.add(key, mValue)
+        y <- client.append(key, ByteString("valueA"))
+        z <- client.get(key)
+      } yield {
+          (w,x,y,z)
+        }
+
+      res.futureValue must be ((false, true, true, Some(Value(ByteString("colITAppend"), ByteString("valuevalueA"), 0))))
     }
 
     "decr" in {
-      val key = ByteString("colITDecr")
-      decr(client, key, 1).futureValue must be (None)
-      add(client, key, ByteString("2")).futureValue must be (true)
-      decr(client, key, 1).futureValue must be (Some(1))
+      val key = getKey("colITDecr")
+
+      val res = for {
+        x <- client.decr(key, 1)
+        y <- client.add(key, ByteString("2"))
+        z <- client.decr(key, 1)
+      } yield {
+          (x,y,z)
+        }
+
+      res.futureValue must be((None, true, Some(1)))
+
     }
 
     "delete" in {
-      val key = ByteString("colITDel")
-      add(client, key, mValue).futureValue must be (true)
-      delete(client, key).futureValue must be (true)
-      delete(client, key).futureValue must be (false)
+      val key = getKey("colITDel")
+      val res = for {
+        x <- client.add(key, mValue)
+        y <- client.delete(key)
+        z <- client.delete(key)
+      } yield {
+          (x,y,z)
+        }
+
+      res.futureValue must be ((true, true, false))
     }
 
     "get multiple keys" in {
-      val keyA = ByteString("colITMGetA")
-      val keyB = ByteString("colITMGetB")
-      val expectedMap = Map("colITMGetA"->Value("colITMGetA", mValue, 0), "colITMGetB"->Value("colITMGetB", mValue, 0))
-      add(client, keyA, mValue).futureValue must be (true)
-      add(client, keyB, mValue).futureValue must be (true)
-      get(client, keyA, keyB).futureValue mustBe expectedMap
+      val keyA = getKey("colITMGetA")
+      val keyB = getKey("colITMGetB")
+      val expectedMap = Map(ByteString("colITMGetA")->Value(ByteString("colITMGetA"), mValue, 0), ByteString("colITMGetB")->Value(ByteString("colITMGetB"), mValue, 0))
+
+      val res = for {
+        _ <- client.add(keyA, mValue)
+        _ <- client.add(keyB, mValue)
+        x <- client.getAll(keyA, keyB)
+      } yield {
+          x
+        }
+
+      res.futureValue must be (expectedMap)
     }
 
     "incr" in {
-      val key = ByteString("colITIncr")
-      incr(client, key, 1).futureValue must be (None)
-      add(client, key, ByteString("2")).futureValue must be (true)
-      incr(client, key, 1).futureValue must be (Some(3))
+      val key = getKey("colITIncr")
+      val res = for {
+        x <- client.incr(key, 1)
+        y <- client.add(key, ByteString("2"))
+        z <- client.incr(key, 1)
+      } yield {
+          (x,y,z)
+        }
+
+      res.futureValue must be ((None, true, Some(3)))
     }
 
     "prepend" in {
-      val key = ByteString("colITPrepend")
-      prepend(client, key, ByteString("valueA")).futureValue must be (false)
-      add(client, key, mValue).futureValue must be (true)
-      prepend(client, key, ByteString("valueP")).futureValue must be (true)
-      get(client, key).futureValue must be (Map("colITPrepend"->Value("colITPrepend", ByteString("valuePvalue"), 0)))
+      val key = getKey("colITPrepend")
+      val res = for {
+        w <- client.prepend(key, ByteString("valueA"))
+        x <- client.add(key, mValue)
+        y <- client.prepend(key, ByteString("valueP"))
+        z <- client.get(key)
+      } yield {
+          (w,x,y,z)
+        }
+
+      res.futureValue must be(false, true, true, Some(Value(ByteString("colITPrepend"), ByteString("valuePvalue"), 0)))
     }
 
     "replace" in {
-      val key = ByteString("colITReplace")
-      replace(client, key, mValue).futureValue must be (false)
-      add(client, key, mValue).futureValue must be (true)
-      replace(client, key, ByteString("newValue")).futureValue must be (true)
-      get(client, key).futureValue must be (Map("colITReplace"->Value("colITReplace", ByteString("newValue"), 0)))
+      val key = getKey("colITReplace")
+      val res = for {
+        w <- client.replace(key, mValue)
+        x <- client.add(key, mValue)
+        y <- client.replace(key, ByteString("newValue"))
+        z <- client.get(key)
+      } yield {
+          (w,x,y,z)
+        }
     }
 
     "set" in {
-      val key = ByteString("colITSet")
-      set(client, key, mValue).futureValue must be (true)
-      get(client, key).futureValue must be (Map("colITSet"->Value("colITSet", ByteString("value"), 0)))
-      set(client, key, ByteString("newValue")).futureValue must be (true)
-      get(client, key).futureValue must be (Map("colITSet"->Value("colITSet", ByteString("newValue"), 0)))
+      val key = getKey("colITSet")
+      val res = for {
+        w <- client.set(key, mValue)
+        x <- client.get(key)
+        y <- client.set(key, ByteString("newValue"))
+        z <- client.get(key)
+      } yield {
+          (w,x,y,z)
+        }
+
+      res.futureValue must be(true, Some(Value(ByteString("colITSet"), ByteString("value"), 0)), true, Some(Value(ByteString("colITSet"), ByteString("newValue"), 0)))
     }
 
     "touch" in {
-      val key = ByteString("colITTouch")
-      touch(client, key, 100).futureValue must be (false)
-      set(client, key, mValue).futureValue must be (true)
-      touch(client, key, 100).futureValue must be (true)
+      val key = getKey("colITTouch")
+      val res = for {
+        x <- client.touch(key, 100)
+        y <- client.set(key, mValue)
+        z <- client.touch(key, 100)
+      } yield {
+          (x,y,z)
+        }
+      res.futureValue must be (false, true, true)
+    }
+
+    val iterations = 100
+    val cycles = 1
+    import java.nio.ByteBuffer
+    val benchmarkKey = "1234567890" * 25
+
+    "benchmark writes" in {
+      for (_ <- 1 to cycles) {
+        val keyA = ByteString(benchmarkKey)
+        val start = System.nanoTime()
+        val fut = (1 to iterations).foldLeft(client.set(keyA, ByteString(0))) {
+          case (agg, i) =>
+            val buff = new Array[Byte](4)
+            val bb = ByteBuffer.wrap(buff)
+            bb.putInt(0, i)
+            agg.flatMap { _ => client.set(keyA, ByteString(buff)) }
+        }.flatMap {
+          case true => client.get(keyA)
+          case false => throw new Exception("set failed!")
+        }
+
+        val result = Await.result(fut, 60 seconds)
+        val nanos = System.nanoTime() - start
+
+        assert(iterations === ByteBuffer.wrap(result.get.data.toArray).getInt())
+        log.info(s"SET benchmark completed $iterations in ${nanos / 1.0E06} ms. ${iterations * 1.0E9 / nanos} iterations/sec")
+      }
+    }
+
+    "benchmark reads" in {
+      for(_ <- 1 to cycles) {
+        import java.nio.ByteBuffer
+        val buff = new Array[Byte](4)
+        val bb = ByteBuffer.wrap(buff)
+        val keyA = ByteString(benchmarkKey)
+        bb.putInt(0, iterations)
+        val start = System.nanoTime()
+        val fut =
+          client.set(keyA, ByteString(buff)).flatMap {
+            case false => throw new Exception("set failed!")
+            case true =>
+              (1 to iterations)
+                .foldLeft(client.get(keyA)) {
+                  case (agg, i) =>
+                    bb.putInt(0, i)
+                    agg.flatMap { _ => client.get(keyA) }
+                }
+          }
+
+        val result = Await.result(fut, 60 seconds)
+        val nanos = System.nanoTime() - start
+
+        assert(iterations === ByteBuffer.wrap(result.get.data.toArray).getInt())
+        log.info(s"GET benchmark completed $iterations in ${nanos / 1.0E06} ms. ${iterations * 1.0E9 / nanos} iterations/sec")
+      }
     }
   }
 
-  //potential client interface (with some refinements)
-  def add(client : AsyncMemacheClient, key : ByteString, value : ByteString, ttl : Int = 0, flags : Int = 0) = {
-    client.send(Add(MemcachedKey(key), value, ttl, flags)).flatMap {
-      case Stored => Future.successful(true)
-      case NotStored => Future.successful(false)
-      case x => Future.failed(new Exception(s"unexpected response $x when adding $key and $value"))
-    }
-  }
-
-  def append(client : AsyncMemacheClient, key : ByteString, value : ByteString) = {
-    client.send(Append(MemcachedKey(key), value)).flatMap {
-      case Stored => Future.successful(true)
-      case NotStored => Future.successful(false)
-      case x => Future.failed(new Exception(s"unexpected response $x when appending $key and $value"))
-    }
-  }
-
-  def decr(client : AsyncMemacheClient, key : ByteString, value : Long) : Future[Option[Long]] = {
-    client.send(Decr(MemcachedKey(key), value)).flatMap {
-      case Counter(v) => Future.successful(Some(v))
-      case NotFound => Future.successful(None)
-      case x => Future.failed(new Exception(s"unexpected response $x when decr $key with $value"))
-    }
-  }
-
-  def delete(client : AsyncMemacheClient, key : ByteString) = {
-    client.send(Delete(MemcachedKey(key))).flatMap {
-      case Deleted => Future.successful(true)
-      case NotFound => Future.successful(false)
-      case x => Future.failed(new Exception(s"unexpected response $x when deleting $key"))
-    }
-  }
-
-  def get(client : AsyncMemacheClient, keys : ByteString*) : Future[Map[String, Value]] = {
-    client.send(Get(keys.map(MemcachedKey(_)) : _*)).flatMap {
-      case a : Value => Future.successful(Map(a.key->a))
-      case Values(x) => Future.successful(x.map(y => y.key->y).toMap)
-      case x => Future.failed(new Exception(s"unexpected response $x when getting $keys"))
-    }
-  }
-
-  def incr(client : AsyncMemacheClient, key : ByteString, value : Long) = {
-    client.send(Incr(MemcachedKey(key), value)).flatMap {
-      case Counter(v) => Future.successful(Some(v))
-      case NotFound => Future.successful(None)
-      case x => Future.failed(new Exception(s"unexpected response $x when incr $key with $value"))
-    }
-  }
-
-  def prepend(client : AsyncMemacheClient, key : ByteString, value : ByteString) = {
-    client.send(Prepend(MemcachedKey(key), value)).flatMap {
-      case Stored => Future.successful(true)
-      case NotStored => Future.successful(false)
-      case x => Future.failed(new Exception(s"unexpected response $x when prepending $key and $value"))
-    }
-  }
-
-  def replace(client : AsyncMemacheClient, key : ByteString, value : ByteString, ttl : Int = 0, flags : Int = 0) = {
-    client.send(Replace(MemcachedKey(key), value, ttl, flags)).flatMap {
-      case Stored => Future.successful(true)
-      case NotStored => Future.successful(false)
-      case x => Future.failed(new Exception(s"unexpected response $x when replacing $key and $value"))
-    }
-  }
-
-
-  def set(client : AsyncMemacheClient, key : ByteString, value : ByteString, ttl : Int = 0, flags : Int = 0) = {
-    client.send(Set(MemcachedKey(key), value, ttl, flags)).flatMap {
-      case Stored => Future.successful(true)
-      case NotStored => Future.successful(false)
-      case x => Future.failed(new Exception(s"unexpected response $x when setting $key and $value"))
-    }
-  }
-
-  def touch(client : AsyncMemacheClient, key : ByteString, ttl : Int = 0) = {
-    client.send(Touch(MemcachedKey(key), ttl)).flatMap {
-      case Touched => Future.successful(true)
-      case NotFound => Future.successful(false)
-      case x => Future.failed(new Exception(s"unexpected response $x when touching $key with $ttl"))
-    }
+  def getKey(key: String): ByteString = {
+    val bKey = ByteString(key)
+    usedKeys += bKey
+    bKey
   }
 }

@@ -4,51 +4,52 @@ import scala.concurrent.duration._
 
 class CounterSpec extends MetricIntegrationSpec {
 
-  "Basic Counter" must {
+  def counter = new DefaultCounter("/foo")
+
+  "Counter" must {
     "increment" in {
-      val c = new BasicCounter(CounterParams("/foo"))
+      val c = counter
+      c.get() must equal(0)
       c.increment()
-      c.value().get must equal(1)
+      c.get() must equal(1)
 
     }
 
     "decrement" in {
-      val c = new BasicCounter(CounterParams("/foo"))
+      val c = counter
       c.increment()
+      c.get() must equal(1)
       c.decrement()
-      c.value().get must equal(0)
+      c.get() must equal(0)
     }
 
-    "delta" in {
-      val c = new BasicCounter(CounterParams("/foo"))
-      c.delta(5)
-      c.delta(-1)
-      c.value().get must equal(4)
-    }   
+    "set" in {
+      val c = counter
+      c.set(value = 3456)
+      c.get() must equal(3456)
+    }
 
     "correctly handle tags" in {
-      val c = new BasicCounter(CounterParams("/foo"))
-      c.increment(Map("a" -> "a"))
-      c.delta(2, Map("a" -> "b"))
-      c.value(Map("a" -> "a")).get must equal(1)
-      c.value(Map("a" -> "b")).get must equal(2)
+      val c = counter
+      c.set(tags = Map("a" -> "a"), 123)
+      c.increment(tags = Map("a" -> "b"))
+      c.increment(tags = Map("a" -> "b"))
+      c.get(Map("a" -> "a")) must equal(123)
+      c.get(Map("a" -> "b")) must equal(2)
     }
 
-    
-  }
-
-
-  "Shared counter" must {
-    "report the correct event" in {
-      import akka.testkit.TestProbe
-      import colossus.metrics.testkit.TestSharedCollection
-      import EventLocality._
-      val probe = TestProbe()
-      val collection = new TestSharedCollection(probe)
-      val counter: Shared[Counter] = collection.getOrAdd(Counter("/foo"))
-      counter.delta(2, Map("a" -> "aa"))
-      probe.expectMsg(10.seconds, Counter.Delta("/foo", 2, Map("a" -> "aa")))
+    "return no metrics when not used yet" in {
+      counter.tick(1.second) must equal(Map())
     }
+
+    "have correct address" in {
+      implicit val ns = MetricContext("/foo", Collection.withReferenceConf(Seq(1.second))) / "bar"
+      val c = Counter("/baz")
+      c.address must equal(MetricAddress("/foo/bar/baz"))
+
+    }
+
+
   }
 
 }

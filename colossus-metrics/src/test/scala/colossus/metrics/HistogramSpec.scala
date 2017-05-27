@@ -1,6 +1,5 @@
 package colossus.metrics
 
-import MetricAddress.Root
 import scala.concurrent.duration._
 
 class HistogramSpec extends MetricIntegrationSpec {
@@ -13,27 +12,34 @@ class HistogramSpec extends MetricIntegrationSpec {
     }
   }
 
-  "Histogram" must {
+  "BaseHistogram" must {
     "simple collection" in {
+      val address = MetricAddress.Root / "latency"
+      val tags = Map("route" -> "home")
       val h = new BaseHistogram(Histogram.generateBucketRanges(10, 10))
       (0 to 10).foreach{h.add}
       h.min must equal (0)
       h.max must equal (10)
       h.count must equal (11)
-      val percs = Seq(0, 0.25, 0.5, 0.75, 0.99, 1.0)
-      h.percentiles(percs) must equal (percs.zip(Seq(0, 2, 5, 8, 9, 10)).toMap)
+      val percentiles = Seq(0.0, 0.25, 0.5, 0.75, 0.99, 1.0)
+      h.percentiles(percentiles) must equal (percentiles.zip(Seq(0, 3, 6, 9, 10, 10)).toMap)
+
+      val metrics = Map(
+        address / "count" -> Map(tags -> 11),
+        address -> Map(
+          tags + ("label" -> "min") -> 0,
+          tags + ("label" -> "max") -> 10,
+          tags + ("label" -> "mean") -> 5,
+          tags + ("label" -> "0.0") -> 0,
+          tags + ("label" -> "0.25") -> 3,
+          tags + ("label" -> "0.5") -> 6,
+          tags + ("label" -> "0.75") -> 9,
+          tags + ("label" -> "0.99") -> 10,
+          tags + ("label" -> "1.0") -> 10
+        )
+      )
+      h.metrics(address, tags, percentiles) must equal (metrics)
     }
-
-
-    "generate snapshot" in {
-      val h = new BaseHistogram(Histogram.generateBucketRanges(10, 10))
-      (0 to 10).foreach{h.add}
-      val percs = List(0, 0.25, 0.5, 0.75, 0.99, 1.0)
-      val values = Seq(0, 2, 5, 8, 9, 10)
-
-      h.snapshot(percs) must equal (Snapshot(0, 10, 11, percs.zip(values).toMap))
-    }
-
 
     "bucketFor" in {
       val h = new BaseHistogram
@@ -41,136 +47,82 @@ class HistogramSpec extends MetricIntegrationSpec {
       h.bucketFor(5) must equal (5)
     }
 
-    "large distribution" in {
-      val h = new BaseHistogram
-      (0 to 50000).foreach{h.add}
-      val zipped = h.bucketList.buckets.zip(h.buckets)
-      (0 until zipped.size - 1).foreach{i =>
-        val (cBucket, cCount) = zipped(i)
-        val (nBucket, nCount) = zipped(i + 1)
-        if (nBucket < 50000) {
-          (nBucket - cBucket) must equal (cCount)
-        }
-      }
+    "return 0 for min when empty" in {
+      (new BaseHistogram).min must equal(0)
     }
+
+    "return 0 for mean when empty" in {
+      (new BaseHistogram).mean must equal(0)
+    }
+
+    "reset everything on tick" in {
+      val h = new BaseHistogram
+      (0 to 10).foreach{h.add}
+      h.tick()
+      h.min mustBe 0
+      h.max mustBe 0
+      h.count mustBe 0
+      h.mean mustBe 0
+      h.percentile(.99) mustBe 0
+    }
+
+
+
   }
 
-  "tagged histogram" must {
-    "combine values with same tags" in {
-      val percs = List(0.25, 0.5, 1.0)
-      val h = new TaggedHistogram(Histogram.generateBucketRanges(10), percs, false)
-      val m = Map("foo" -> "bar")
-      h.add(4, m)
-      h.add(400, m)
-      h(m).percentiles(percs) must equal (percs.zip(Seq(4, 4, 400)).toMap)
+  "Histogram" must {
+
+    "correctly generate address based on namespace" in {
+      implicit val ns = MetricContext("/foo", Collection.withReferenceConf(Seq(1.second))) / "bar"
+      val h = Histogram("baz")
+      h.address must equal(MetricAddress("/foo/bar/baz"))
     }
 
-    "seperate values with different tag values" in {
-      val h = new TaggedHistogram(Histogram.generateBucketRanges(10), Nil, false)
-      h.add(3, Map("foo" -> "a"))
-      h.add(30000, Map("foo" -> "b"))
-      h(Map("foo" -> "a")).max must equal (3)
-      h(Map("foo" -> "b")).max must equal (30000)
-    }
+    "get tags right" in {
+      implicit val col = MetricContext("/", Collection.withReferenceConf(Seq(1.second)))
+      val addr = MetricAddress.Root / "hist"
+      val h = Histogram(addr)
+      h.add(10, Map("foo" -> "bar"))
+      h.add(20, Map("foo" -> "baz"))
+      h.add(20, Map("foo" -> "baz"))
 
-    "produce raw stats" in {
-      val percs = List(0.75, 0.99)
-      val h = new TaggedHistogram(Histogram.generateBucketRanges(10), percs, false)
-      val exp1 = new BaseHistogram(Histogram.generateBucketRanges(10))
-      val exp2 = new BaseHistogram(Histogram.generateBucketRanges(10))
-      (0 to 100).foreach{i =>
-        h.add(i, Map("foo" -> "bar"))
-        exp1.add(i)
-      }
-      (100 to 200).foreach{i =>
-        h.add(i, Map("foo" -> "baz"))
-        exp2.add(i)
-      }
-      val expected: Map[TagMap, Snapshot] = Map(
-        Map("foo" -> "bar") -> Snapshot(0, 100, 101, exp1.percentiles(percs)),
-        Map("foo" -> "baz") -> Snapshot(100, 200, 101, exp2.percentiles(percs))
-      )
-      h.tick()
-
-      val actual = h.snapshots
-
-      actual must equal (expected)
+      val m = h.tick(1.second)
+      m(addr)(Map("foo" -> "bar", "label" -> "min")) must equal(10)
+      m(addr)(Map("foo" -> "baz", "label" -> "min")) must equal(20)
+      m(addr / "count")(Map("foo" -> "bar")) must equal(1)
+      m(addr / "count")(Map("foo" -> "baz")) must equal(2)
     }
 
     "prune empty values" in {
-      val h = new TaggedHistogram(Histogram.generateBucketRanges(10), Nil, true)
-      h.add(3, Map("foo" -> "a"))
-      h.add(4, Map("foo" -> "b"))
-      h.tick()
-      h.snapshots.contains(Map("foo" -> "a")) must equal(true)
-      h.snapshots.contains(Map("foo" -> "b")) must equal(true)
-
-      h.add(3, Map("foo" -> "a"))
-      h.tick()
-      h.snapshots.contains(Map("foo" -> "a")) must equal(true)
-      h.snapshots.contains(Map("foo" -> "b")) must equal(false)
+      implicit val col = MetricContext("/", Collection.withReferenceConf(Seq(1.second)))
+      val addr = MetricAddress.Root / "hist"
+      val h = Histogram(addr, pruneEmpty = true)
+      h.add(10, Map("foo" -> "bar"))
+      h.add(20, Map("foo" -> "baz"))
+      h.add(20, Map("foo" -> "baz"))
+      val m = h.tick(1.second)
+      m(addr)(Map("foo" -> "bar", "label" -> "min")) must equal(10)
+      m(addr)(Map("foo" -> "baz", "label" -> "min")) must equal(20)
+      h.add(10, Map("foo" -> "bar"))
+      val m2 = h.tick(1.second)
+      m(addr)(Map("foo" -> "bar", "label" -> "min")) must equal(10)
+      m2(addr).get(Map("foo" -> "baz", "label" -> "min")).isEmpty must equal(true)
     }
 
-
-
-  }
-
-  "PeriodicHistogram" must {
-    "properly tick for intervals" in {
-      val params = HistogramParams(Root / "foo", percentiles = List(0.5), sampleRate = 1.0)
-      val config = CollectorConfig(List(1.second, 1.minute))
-      val hist = new PeriodicHistogram(params, config)
-
-      var i = 0
-      def check(interval: FiniteDuration, expected: Long) {
-        i += 1
-        val m = hist.metrics(CollectionContext(TagMap.Empty, interval))
-        m(Root / "foo")(Map("percentile" -> "0.5")) match {
-          case MetricValues.WeightedAverageValue(value, weight) => if (value != expected) {
-            throw new Exception(s"Check $i failed, expected $expected, got $value")
-          }
-          case _ => throw new Exception("wrong value type")
-        }
-      }
-      def checkEmpty(interval: FiniteDuration) {
-        hist.metrics(CollectionContext(TagMap.Empty, interval)) must equal(Map())
-      }
-
-      checkEmpty(1.second)
-      checkEmpty(1.minute)
-      hist.add(5)
-
-      checkEmpty(1.second)
-      checkEmpty(1.minute)
-      
-      hist.tick(1.second)
-      check(1.second, 5)
-      checkEmpty(1.minute)
-      
-      hist.tick(1.minute)
-      check(1.second, 5)
-      check(1.minute, 5)
-      
-      hist.tick(1.second)
-      check(1.second, 0)
-      check(1.minute, 5)      
-
+    "get values for specific interval" in {
+      implicit val col = MetricContext("/", Collection.withReferenceConf(Seq(1.second, 1.minute)))
+      val addr = MetricAddress.Root / "hist"
+      val h = Histogram(addr)
+      h.add(10)
+      h.add(50)
+      h.count(1.second) mustBe 2
+      h.percentile(1.second, 0.5) mustBe 12
+      h.count(1.minute) mustBe 2
+      h.tick(1.second)
+      h.count(1.second) mustBe 0
+      h.count(1.minute) mustBe 2
+      h.percentile(1.second, 0.5) mustBe 0
     }
 
   }
-
-  "Shared Histogram" must {
-    "report the correct event" in {
-      import akka.testkit.TestProbe
-      import colossus.metrics.testkit.TestSharedCollection
-      import EventLocality._
-      val probe = TestProbe()
-      val collection = new TestSharedCollection(probe)
-      val hist: Shared[Histogram] = collection.getOrAdd(Histogram("/foo"))
-      hist.add(23, Map("a" -> "aa"))
-      probe.expectMsg(10.seconds, PeriodicHistogram.Add("/foo", Map("a" -> "aa"), 23))
-    }
-  }
-      
-      
 }

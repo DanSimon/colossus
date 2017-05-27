@@ -3,7 +3,7 @@ package service
 
 import akka.actor.ActorRef
 import core.{WorkerItem, WorkerRef}
-import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.Promise
 import scala.reflect.ClassTag
 
 import java.net.InetSocketAddress
@@ -15,7 +15,7 @@ import java.net.InetSocketAddress
  * This currently doesn't iterate through every possible permutation, but it
  * does evenly distribute 1st and 2nd tries...needs some more work
  */
-class PermutationGenerator[T : ClassTag](val seedlist: List[T]) extends Iterator[List[T]] {
+class PermutationGenerator[T : ClassTag](val seedlist: Seq[T]) extends Iterator[List[T]] {
   private val items:Array[T] = seedlist.toArray
 
   private var swapIndex = 1
@@ -56,10 +56,10 @@ class PermutationGenerator[T : ClassTag](val seedlist: List[T]) extends Iterator
   }
 
 }
-  
-class LoadBalancingClientException(message: String) extends Exception(message)  
+
+class LoadBalancingClientException(message: String) extends Exception(message)
 class SendFailedException(tries: Int, finalCause: Throwable) extends Exception(
-  s"Failed after ${tries} tries, error on last try: ${finalCause.getMessage}", 
+  s"Failed after ${tries} tries, error on last try: ${finalCause.getMessage}",
   finalCause
 )
 
@@ -74,54 +74,54 @@ class SendFailedException(tries: Int, finalCause: Throwable) extends Exception(
  * Note that the balancer will never try the same client twice for a request,
  * so setting maxTries to a very large number will mean that every client will
  * be tried once
+ *
+ * TODO: does this need to actually be a WorkerItem anymore?
  */
-class LoadBalancingClient[I,O] (
+class LoadBalancingClient[P <: Protocol] (
   worker: WorkerRef,
-  generator: InetSocketAddress => ServiceClient[I,O], 
-  maxTries: Int = Int.MaxValue,   
+  generator: InetSocketAddress => Sender[P, Callback],
+  maxTries: Int = Int.MaxValue,
   initialClients: Seq[InetSocketAddress] = Nil
-) extends ServiceClientLike[I,O] with WorkerItem {
+) extends WorkerItem(worker.generateContext) with Sender[P, Callback]  {
 
+  worker.bind(_ => this)
 
-  private val clients = collection.mutable.ArrayBuffer[ServiceClient[I,O]]()
+  case class Client(address: InetSocketAddress, client: Sender[P, Callback])
 
-  private var permutations = new PermutationGenerator(clients.toList)
+  private val clients = collection.mutable.ArrayBuffer[Client]()
 
-  update(initialClients)
+  private var permutations = new PermutationGenerator(clients.map{_.client})
 
-  worker.bind(this)
-
-  //note, this type must be inner to avoid type erasure craziness
-  case class Send(request: I, promise: Promise[O])
-
+  update(initialClients, true)
 
   private def regeneratePermutations() {
-    permutations = new PermutationGenerator(clients.toList)
+    permutations = new PermutationGenerator(clients.map{_.client})
   }
 
-  def currentClients = clients.toList
-
-    
-  private def addClient(address: InetSocketAddress, regen: Boolean): ServiceClient[I,O] = {
-    val client = generator(address)
-    clients.append(client)
-    regeneratePermutations()
-    client
-  }
-
-  def addClient(address: InetSocketAddress): ServiceClient[I,O] = addClient(address, true)
-
-  def removeClient(client: ServiceClient[I,O]) {
-    client.gracefulDisconnect()
-    clients.remove(clients.indexOf(client))
+  private def addClient(address: InetSocketAddress, regen: Boolean): Unit = {
+    val client = Client(address, generator(address))
+    clients append client
     regeneratePermutations()
   }
 
+  def addClient(address: InetSocketAddress): Unit = addClient(address, true)
+
+  private def removeFilter(filter: Client => Boolean) {
+    var i = 0
+    while (i < clients.length) {
+      if (filter(clients(i))) {
+        clients(i).client.disconnect()
+        clients.remove(i)
+      } else {
+        i += 1
+      }
+    }
+  }
+  
   def removeClient(address: InetSocketAddress) {
-    val client = clients.find{_.config.address == address}.getOrElse(
-      throw new LoadBalancingClientException(s"Tried to remove non-existant client: $address")
-    )
-    removeClient(client)
+    removeFilter{c =>
+      c.address == address
+    }
     regeneratePermutations()
   }
 
@@ -129,30 +129,29 @@ class LoadBalancingClient[I,O] (
    * Updates the client list, creating connections for new addresses not in the
    * existing list and closing connections not in the new list
    */
-  def update(addresses: Seq[InetSocketAddress]) {
-    val toRemove = clients.filter{client => !addresses.contains(client.config.address)}
-    toRemove.foreach(removeClient)
-    addresses.foreach{address => 
-      if (!clients.exists{_.config.address == address}) {
+  def update(addresses: Seq[InetSocketAddress], allowDuplicates: Boolean = false) {
+    removeFilter(c => !addresses.contains(c.address))
+    addresses.foreach{address =>
+      if (! clients.exists{_.address == address} || allowDuplicates) {
         addClient(address,false)
       }
     }
     regeneratePermutations()
   }
 
-  def gracefulDisconnect() {
-    clients.foreach{_.gracefulDisconnect()}
+  def disconnect() {
+    clients.foreach{_.client.disconnect()}
     clients.clear()
   }
-      
 
-  def send(request: I): Callback[O] = {
+
+  def send(request: P#Input): Callback[P#Output] = {
     val retryList =  permutations.next().take(maxTries)
-    def go(next: ServiceClientLike[I,O], list: List[ServiceClientLike[I, O]]): Callback[O] = next.send(request).recoverWith{
+    def go(next: Sender[P, Callback], list: List[Sender[P, Callback]]): Callback[P#Output] = next.send(request).recoverWith{
       case err => list match {
         case head :: tail => go(head, tail)
         case Nil => Callback.failed(new SendFailedException(retryList.size, err))
-      }      
+      }
     }
     if (retryList.isEmpty) {
       Callback.failed(new SendFailedException(retryList.size, new Exception("Empty client list!")))
@@ -162,9 +161,6 @@ class LoadBalancingClient[I,O] (
   }
 
   override def receivedMessage(message: Any, sender: ActorRef) {
-    message match {
-      case Send(request, promise) => send(request).execute(promise.complete)
-    }
   }
 
 }

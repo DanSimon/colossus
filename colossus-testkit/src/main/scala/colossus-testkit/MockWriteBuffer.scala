@@ -8,54 +8,68 @@ import akka.util.{ByteString, ByteStringBuilder}
 /**
  * if a handler is passed, the buffer will call the handler's readyForData, and it will call it's own handleWrite if interestRW is true
  */
-class MockWriteBuffer(val maxWriteSize: Int, handler: Option[ConnectionHandler] = None) extends WriteBuffer {
+trait MockChannelActions extends ChannelActions {
+
+  def maxWriteSize: Int
+
+
   protected var bytesAvailable = maxWriteSize
   private var writeCalls = collection.mutable.Queue[ByteString]()
   protected var connection_status: ConnectionStatus = ConnectionStatus.Connected
 
-  private var bufferCleared = false
+  def status = connection_status
 
-  protected def setKeyInterest(){}
+  private var bufferCleared = false
 
   private val writtenData = new ByteStringBuilder
 
-  val internalBufferSize = 1
+  def channelWrite(data: DataBuffer) = {
+    if (bytesAvailable == 0) {
+      0
+    } else {
+      val toTake = math.min(bytesAvailable, data.remaining)
+      bytesAvailable -= toTake
+      //println(s"$toTake : $bytesAvailable")
+      val bytes = ByteString(data.take(toTake))
+      writeCalls.enqueue(bytes)
+      bytes.size
+    }
 
-  def onBufferClear(){
   }
 
-  //this never gets called
-  def channelWrite(data: DataBuffer) = 0
+
+  def finishConnect(){}
+
+  def keyInterestOps(ops: Int) {}
+
+  def channelClose() {
+    connection_status = ConnectionStatus.NotConnected
+  }
+
+  def channelHost() = java.net.InetAddress.getLocalHost()
+
+  /*
+  def completeDisconnect() {
+    connection_status = ConnectionStatus.NotConnected
+  }
+  */
+
+
+  //legacy method
+  def disconnectCalled = status == ConnectionStatus.NotConnected
 
   def clearBuffer(): ByteString = {
+    println("clearing buffer")
     val lastsize = bytesAvailable
     bytesAvailable = maxWriteSize
     val builder = new ByteStringBuilder
     while (!writeCalls.isEmpty) {
       builder ++= writeCalls.dequeue()
     }
-    if (lastsize == 0) {
-      handler.foreach{_.readyForData()}
-    }
     builder.result
   }
 
-  override def write(raw: DataBuffer) : WriteStatus = {
-    if (bytesAvailable == 0) {
-      WriteStatus.Zero
-    } else {
-      bytesAvailable -= raw.remaining
-      val data = ByteString(raw.takeAll)
-      writeCalls.enqueue(data)
-      if (bytesAvailable < 0) {
-        bytesAvailable = 0
-        WriteStatus.Partial
-      } else {
-        WriteStatus.Complete
-      }
-    }
-    
-  }
+  private def debugDump(debug: Boolean) = if (debug) writeCalls.mkString(",") else ""
 
   def expectWrite(data: ByteString) {
     assert(writeCalls.size > 0, "expected write, but no write occurred")
@@ -66,13 +80,13 @@ class MockWriteBuffer(val maxWriteSize: Int, handler: Option[ConnectionHandler] 
   /**
    * Expect exactly `num` writes
    */
-  def expectNumWrites(num: Int) {
-    assert(writeCalls.size == num, s"expected exactly $num writes, but ${writeCalls.size} writes occurred")
+  def expectNumWrites(num: Int, debug: Boolean = false) {
+    assert(writeCalls.size == num, s"""expected exactly $num writes, but ${writeCalls.size} writes occurred ${debugDump(debug)} """)
     writeCalls.clear()
   }
 
-  def expectOneWrite(data: ByteString) {
-    assert(writeCalls.size == 1, s"expected exactly one write, but ${writeCalls.size} writes occurred")
+  def expectOneWrite(data: ByteString, debug: Boolean = false) {
+    assert(writeCalls.size == 1, s"expected exactly one write, but ${writeCalls.size} writes occurred ${debugDump(debug)}")
     expectWrite(data)
   }
 
@@ -80,23 +94,18 @@ class MockWriteBuffer(val maxWriteSize: Int, handler: Option[ConnectionHandler] 
     assert(writeCalls.size == 0, s"Expected no write, but data '${writeCalls.head.utf8String}' was written")
   }
 
-  /*
-  def expectBufferCleared() {
-    assert(bufferCleared == true, "Expected write buffer to be cleared, but it was no")
-    bufferCleared = false
-  }
-
-  def expectBufferNotCleared() {
-    assert(bufferCleared == false, "Expected write buffer to not be cleared, but it was")
-  }
-  */
-
   def withExpectedWrite(f: ByteString => Unit) {
     assert(writeCalls.size > 0, "expected write, but no write occurred")
     val call = writeCalls.dequeue()
     f(call)
   }
-    
 
-    
+
+
+}
+
+class MockWriteBuffer(val maxWriteSize: Int) extends WriteBuffer with MockChannelActions {
+  def completeDisconnect(){channelClose()}
+
+  def testWrite(d: DataBuffer): WriteStatus = write(d)
 }

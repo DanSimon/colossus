@@ -1,81 +1,57 @@
 package colossus.metrics
 
+import org.scalatest.{MustMatchers, WordSpec}
+import scala.concurrent.duration._
 
-import akka.actor._
-import akka.testkit._
+class CollectionSpec extends WordSpec with MustMatchers{
 
-import scala.language.higherKinds
+  "Collection" must {
 
-import org.scalatest._
+    val collection = Collection.withReferenceConf(Seq(1.minute, 1.second))
 
-class NewSpec extends WordSpec with MustMatchers with BeforeAndAfterAll{
+    implicit val namespace = MetricContext("/", collection)
 
-  implicit val sys = ActorSystem("test")
+    "getOrAdd should add a new Collector" in {
+      //note, this constructor implicitly adds its constructed object into this collection
+      val foo = MetricAddress("foo")
+      val rate = Rate(foo, false, true)
 
-  def localCProbe: (LocalCollection, TestProbe) = {
-    val p = TestProbe()
-    implicit val a = p.ref
-    (new LocalCollection, p)
-  }
-
-  override def afterAll() {
-    sys.shutdown()
-  }
-
-  "LocalCollection" must {
-    "create a local collection" in {
-      val (c, probe) = localCProbe
-      1 must equal(1)
+      val x = namespace.collection.collectors.get(foo)
+      x.collector mustBe a[Rate]
+      //this is a reference check, since we are not overriding .equals yet
+      x.collector.asInstanceOf[Rate] mustBe rate
     }
 
-    "create a rate" in {
-      val (c, probe) = localCProbe
-      val r: Rate = c.getOrAdd(Rate("/foo"))
-      1 must equal(1)
+    "getOrAdd should return an existing Collector" in {
+      //note, this constructor implicitly adds its constructed object into this collection
+      val bar = MetricAddress("bar")
+
+      val rate = Rate(bar, false, true)
+      val rate2 = Rate(bar, false, true)
+      val x = namespace.collection.collectors.get(bar)
+      x.collector mustBe a[Rate]
+      //reference check again, this should be pointing at the first, since the second should have never got added
+      x.collector.asInstanceOf[Rate] mustBe rate
     }
 
-    "create a counter" in {
-      val (c, probe) = localCProbe
-      val co: Counter = c.getOrAdd(Counter("/foo"))
-      1 must equal(1)
-    }
-
-    "return existing collector of same name and type" in {
-      val (c, probe) = localCProbe
-      val r: Rate = c.getOrAdd(Rate("/foo"))
-      val r2: Rate = c.getOrAdd(Rate("/foo"))
-      r must equal(r2)
-    }
-
-    "throw exception on creating wrong type on address match" in {
-      val (c, probe) = localCProbe
-      val r: Rate = c.getOrAdd(Rate("/foo"))
-      a[DuplicateMetricException] must be thrownBy {
-        val co: Counter = c.getOrAdd(Counter("/foo"))
+    "getOrAdd should throw if a metric with the same address, but different type is used" in {
+      val bar = MetricAddress("baz")
+      val rate = Rate(bar, false, true)
+      intercept[DuplicateMetricException]{
+        Counter(bar, false)
       }
     }
 
-    "create a subcollection" in {
-      val (c, probe) = localCProbe
-      val sub = c.subCollection("/bar")
-      val r: Rate = sub.getOrAdd(Rate("/baz"))
-      r.address must equal(MetricAddress("/bar/baz"))
+    "aggregate tags" in {
+      val subNamespace = namespace / "foo" * ("a" -> "b")
+      val bar = MetricAddress("baz")
+      val rate = Rate(bar, false, true)(subNamespace)
+      rate.hit()
+      collection.tick(1.minute) mustBe Map(
+        MetricAddress("/foo/baz") -> Map(Map("a" -> "b") -> 1),
+        MetricAddress("/foo/baz/count") -> Map()
+      )
     }
-
-    "uniqueness of addresses in sub collections" in {
-      val (c, probe) = localCProbe
-      val sub = c.subCollection("/bar")
-      val o: Counter = c.getOrAdd(Counter("/bar/baz"))
-      a[DuplicateMetricException] must be thrownBy {
-        val r: Rate = sub.getOrAdd(Rate("/baz"))
-      }
-
-    }
-      
   }
-
-  
-
 
 }
-

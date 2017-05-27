@@ -1,48 +1,33 @@
 package colossus
 package controller
 
+import colossus.parsing.DataSize
+import colossus.parsing.DataSize._
 import core._
 import service.Codec
 
 import scala.concurrent.duration.Duration
-
-/** trait representing a decoded message that is actually a stream
- * 
- * When a codec decodes a message that contains a stream (perhaps an http
- * request with a very large body), the returned message MUST extend this
- * trait, otherwise the InputController will not know to push subsequent data
- * to the stream message and things will get all messed up. 
- */
-trait StreamMessage {
-  def sink: Sink[DataBuffer]
-}
 
 /**
  * Configuration for the controller
  *
  * @param outputBufferSize the maximum number of outbound messages that can be queued for sending at once
  * @param sendTimeout if a queued outbound message becomes older than this it will be cancelled
+ * @param inputMaxSize maximum allowed input size (in bytes)
+ * @param flushBufferOnClose
  */
 case class ControllerConfig(
   outputBufferSize: Int,
-  sendTimeout: Duration
+  sendTimeout: Duration,
+  inputMaxSize: DataSize = 1.MB,
+  flushBufferOnClose: Boolean = true,
+  metricsEnabled: Boolean = true
 )
 
 //used to terminate input streams when a connection is closing
 class DisconnectingException(message: String) extends Exception(message)
 
 
-sealed trait ConnectionState
-sealed trait AliveState extends ConnectionState {
-  def endpoint: WriteEndpoint
-}
-
-object ConnectionState {
-  case object NotConnected extends ConnectionState
-  case class Connected(endpoint: WriteEndpoint) extends ConnectionState with AliveState
-  case class Disconnecting(endpoint: WriteEndpoint) extends ConnectionState with AliveState
-}
-class InvalidConnectionStateException(state: ConnectionState) extends Exception(s"Invalid connection State: $state")
 
 
 
@@ -51,10 +36,12 @@ class InvalidConnectionStateException(state: ConnectionState) extends Exception(
  * ultimately implemented by Controller.  This merely contains methods needed
  * by both input and output controller
  */
-trait MasterController[Input, Output] extends ConnectionHandler {
-  protected def state: ConnectionState
+trait MasterController[Input, Output] extends ConnectionHandler with IdleCheck {
+  protected def connectionState: ConnectionState
   protected def codec: Codec[Output, Input]
   protected def controllerConfig: ControllerConfig
+
+  implicit def namespace : metrics.MetricNamespace
 
   //needs to be called after various actions complete to check if it's ok to disconnect
   private[controller] def checkControllerGracefulDisconnect()
@@ -77,33 +64,20 @@ trait MasterController[Input, Output] extends ConnectionHandler {
  * "response" message, the controller make no such pairing.  Thus a controller
  * can be thought of as a duplex stream of messages.
  */
-abstract class Controller[Input, Output](val codec: Codec[Output, Input], val controllerConfig: ControllerConfig) 
-extends InputController[Input, Output] with OutputController[Input, Output] {
+abstract class Controller[Input, Output](val codec: Codec[Output, Input], val controllerConfig: ControllerConfig, context: Context)
+extends CoreHandler(context) with InputController[Input, Output] with OutputController[Input, Output] {
   import ConnectionState._
 
-  protected var state: ConnectionState = NotConnected
-  def isConnected = state != NotConnected
 
-  def connected(endpt: WriteEndpoint) {
-    state match {
-      case NotConnected => state = Connected(endpt)
-      case other => throw new InvalidConnectionStateException(other)
-    }
+  override def connected(endpt: WriteEndpoint) {
+    super.connected(endpt)
     codec.reset()
     outputOnConnected()
     inputOnConnected()
   }
 
-  /**
-   * Returns a read-only trait containing live information about the connection.
-   */
-  def connectionInfo: Option[ConnectionInfo] = state match {
-    case a: AliveState => Some(a.endpoint)
-    case _ => None
-  }
 
   private def onClosed() {
-    state = NotConnected
     inputOnClosed()
     outputOnClosed()
   }
@@ -116,40 +90,35 @@ extends InputController[Input, Output] with OutputController[Input, Output] {
     onClosed()
   }
 
-  def disconnect() {
-    //this has to be public to be used for clients
-    state match {
-      case a: AliveState => {
-        a.endpoint.disconnect()
-      }
-      case _ => {}
-    }
-  }
-
-  /**
-   * stops reading from the connection and accepting new writes, but waits for
-   * pending/ongoing write operations to complete before disconnecting
-   */
-  def gracefulDisconnect() {
-    state match {
-      case Connected(e) => {
-        state = Disconnecting(e)
-      }
-      case Disconnecting(e) => {}
-      case other => throw new InvalidConnectionStateException(other)
-    }
+  override def shutdown() {
     inputGracefulDisconnect()
     outputGracefulDisconnect()
     checkControllerGracefulDisconnect()
   }
 
+  def fatalInputError(reason: Throwable) = {
+
+    processBadRequest(reason).foreach { output =>
+      push(output) { _ => {} }
+    }
+    disconnect()
+    //throw reason
+  }
+
+  /**
+   * Checks the status of the shutdown procedure.  Only when both the input and
+   * output sides are terminated do we call shutdownRequest on the parent
+   */
   private[controller] def checkControllerGracefulDisconnect() {
-    (state, inputState, outputState) match {
-      case (Disconnecting(endpoint), InputState.Terminated, OutputState.Terminated) => {
-        endpoint.disconnect()
-        state = NotConnected
+    (connectionState, inputState, outputState) match {
+      case (ShuttingDown(endpoint), InputState.Terminated, OutputState.Terminated) => {
+        super.shutdown()
       }
-      case _ => {} 
+      case (NotConnected, _, _) => {
+        //can happen when disconnect is called before being connected
+        super.shutdown()
+      }
+      case _ => {}
     }
   }
 

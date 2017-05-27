@@ -147,7 +147,7 @@ class FastReplySuite extends FlatSpec with ShouldMatchers{
 
   it should "parse bulk reply in fragments" in {
     val reply = ByteString("$5\r\nabcde\r\n")
-    (1 until reply.size-1).foreach{i => 
+    (1 until reply.size-1).foreach{i =>
       val parser = replyParser
       val (p1, p2) = reply.splitAt(i)
       parser.parse(DataBuffer.fromByteString(p1)) should equal (None)
@@ -178,22 +178,5 @@ class FastReplySuite extends FlatSpec with ShouldMatchers{
     val parser = replyParser
     parser.parse(reply.raw) should equal(Some(reply))
   }
-
-  it should "accept reply under the size limit" in {
-    val reply = ByteString("+OK\r\n")
-    val parser = RedisReplyParser(reply.size.bytes)
-    val actual = parser.parse(DataBuffer.fromByteString(reply) )
-    actual should equal (Some(StatusReply("OK")))
-  }
-
-  it should "reject reply over the size limit" in {
-    val reply = ByteString("+OK\r\n")
-    val parser = RedisReplyParser((reply.size - 1).bytes)
-    intercept[ParseException]{
-      parser.parse(DataBuffer(reply))
-    }
-  }
-
-
 }
 

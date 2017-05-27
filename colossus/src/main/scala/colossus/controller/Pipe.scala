@@ -13,6 +13,8 @@ trait Transport {
   def terminate(reason: Throwable)
 
   def terminated : Boolean
+
+  def isClosed: Boolean
 }
 
 /**
@@ -79,17 +81,19 @@ trait Source[T] extends Transport {
       case None => Callback.successful(init)
       }
   }
-    
+
 
   def ++(next: Source[T]): Source[T] = new DualSource(this, next)
 
 }
 
 abstract class Generator[T] extends Source[T] {
-  
+
   private var _terminated: Option[Throwable] = None
+  private var _closed = false
 
   def terminated = _terminated.isDefined
+  def isClosed = _closed
 
   def terminate(reason: Throwable) {
     _terminated = Some(reason)
@@ -99,7 +103,9 @@ abstract class Generator[T] extends Source[T] {
 
   def pull(f: Try[Option[T]] => Unit) {
     _terminated.map{t => f(Failure(new PipeTerminatedException(t)))}.getOrElse {
-      f(Success(generate()))
+      val r = generate()
+      if (r.isEmpty) _closed = true
+      f(Success(r))
     }
   }
 }
@@ -123,6 +129,7 @@ object Source {
     }
 
     def terminated = item.isFailure
+    def isClosed = item.filter{_.isEmpty}.isSuccess
   }
 }
 
@@ -197,7 +204,7 @@ object PushResult {
 }
 
 /** A pipe designed to accept a fixed number of bytes
- * 
+ *
  * BE AWARE: when pushing buffers into this pipe, if the pipe completes, the
  * buffer may still contain unread data meant for another consumer
  */
@@ -226,7 +233,7 @@ class FiniteBytePipe(totalBytes: Long) extends InfinitePipe[DataBuffer] {
         }
         //need to get this value here, since remaining might be 0 after call
         val toAdd = partial.remaining
-        val res = super.push(partial) 
+        val res = super.push(partial)
         if (res.isInstanceOf[PushResult.Pushed]) {
           taken += toAdd
           if (taken == totalBytes) {
@@ -274,6 +281,8 @@ class DualSource[T](a: Source[T], b: Source[T]) extends Source[T] {
   }
 
   override def terminated: Boolean = a.terminated && b.terminated
+
+  def isClosed = a.isClosed && b.isClosed
 }
 
 
@@ -313,7 +322,7 @@ class InfinitePipe[T] extends Pipe[T, T] {
    * The value will only be successfully pushed only if there has already a
    * been a request for data on the pulling side.  In other words, the pipe
    * will never interally queue a value.
-   * 
+   *
    * @return the result of the push
    * @throws PipeException when pushing to a full pipe
    */
@@ -342,9 +351,9 @@ class InfinitePipe[T] extends Pipe[T, T] {
     case Closed       => PushResult.Closed
     case Pulling(cb)  => throw new PipeStateException("This should never happen")
   }
-  
+
   /** Request the next value from the pipe
-   * 
+   *
    * Only one value can be requested at a time.  Also there can only be one
    * outstanding request at a time.
    *
@@ -359,15 +368,15 @@ class InfinitePipe[T] extends Pipe[T, T] {
       trig.trigger()
     }
   }
-      
-    
+
+
   def complete() {
     val oldstate = state
     state = Closed
     oldstate match {
       case Full(trig)   => trig.trigger()
       case Pulling(cb)  => cb(Success(None))
-      case Dead(reason) => throw new PipeTerminatedException(reason) 
+      case Dead(reason) => throw new PipeTerminatedException(reason)
       case _ => {}
     }
   }

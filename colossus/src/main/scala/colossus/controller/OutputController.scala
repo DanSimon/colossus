@@ -2,67 +2,120 @@ package colossus
 package controller
 
 import core._
-import scala.concurrent.duration.Duration
+import java.util.LinkedList
+import scala.annotation.tailrec
+import scala.concurrent.duration._
 import scala.util.{Success, Failure}
 
 import service.{NotConnectedException, RequestTimeoutException}
 
+/**
+ * The DataQueue is used only when processing a stream.  It is used to buffer
+ * data in between when the stream produces it and when it is ready to write to
+ * the output buffer.  It also ensures that we don't pull too much data from a
+ * stream, for example if a stream is infinite
+ */
+class DataQueue(maxBytes: Long) {
 
-sealed trait OutputState 
+  private var total = 0L
+  private val queue = new LinkedList[(DataBuffer, Long)]
+
+  def dataSize = total
+  def itemSize = queue.size
+
+  def isFull = total >= maxBytes
+  def isEmpty = itemSize == 0
+
+  def head = queue.peek._1
+
+  /**
+   * returns true if the queue can accept more data
+   */
+  def enqueue(data: DataBuffer): Boolean = {
+    val size = data.remaining
+    total += size
+    queue.add(data -> size)
+    isFull
+  }
+
+  def dequeue: DataBuffer = {
+    val (data, size) = queue.remove
+    total -= size
+    data
+  }
+
+}
+
+case class QueuedItem[T](item: T, postWrite: QueuedItem.PostWrite, creationTimeMillis: Long) {
+  def isTimedOut(now: Long, timeout: Duration) = timeout.isFinite && now > (creationTimeMillis + timeout.toMillis)
+}
+object QueuedItem {
+  type PostWrite = OutputResult => Unit
+}
+
+class MessageQueue[T](maxSize: Int) {
+
+  private val queue = new LinkedList[QueuedItem[T]]
+
+  def isEmpty = queue.size == 0
+  def isFull = queue.size >= maxSize
+  def size = queue.size
+
+  def enqueue(item: T, postWrite: QueuedItem.PostWrite, created: Long): Boolean = if (!isFull) {
+    queue.add(QueuedItem(item, postWrite, created))
+    true
+  } else false
+
+  def head = queue.peek
+
+  def dequeue = queue.remove
+
+}
+
+
+sealed trait OutputState {
+  def canPush : Boolean
+}
+sealed trait AliveOutputState extends OutputState {
+  val canPush = true
+}
+
 object OutputState{
 
-  /**
-   * The controller is not in the middle of writing a message and is actively
-   * dequeuing pending messages.  This is the normal state when it is writing
-   * non-streamed messages and the entire message is written in one call to
-   * write
-   */
-  case object Dequeueing extends OutputState
+  case object Dequeueing extends AliveOutputState
+  case class  Streaming(source: Source[DataBuffer], dataQ: DataQueue, post : QueuedItem.PostWrite) extends AliveOutputState
+  case object Suspended extends OutputState {
+    def canPush = true
+  }
+  case object Terminated extends OutputState {
+    def canPush = false
+  }
 
-  /**
-   * The controller is in the middle of writing a single message.  This state
-   * only occurs when the message was too large to write in one call, and we're
-   * waiting for the socket's underlying buffer to clear out before writing the
-   * rest
-   */
-  case class Writing(postWrite: OutputResult => Unit) extends OutputState
-  
-  /**
-   * The controller is currently streaming out a streamed message.  This state
-   * does not keep track of whether the underlying socket buffer is full or
-   * not.
-   */
-  case class Streaming(source: Source[DataBuffer], postWrite: OutputResult => Unit) extends OutputState
-
-  /**
-   * In this state, the controller is effectively disabled.  This generally
-   * only occurs once the underlying connection has been disconnected.  Be
-   * aware that it is possible for a controller to re-establish a connection,
-   * so Terminated is not necessarily an end state.
-   */
-  case object Terminated extends OutputState //only used when disconnecting
 }
 
 /**
  * This is thrown anytime we hit a state that shouldn't be possible.  If this
  * is ever thrown, there is a bug!
  */
-class InvalidOutputStateException(state: OutputState) extends Exception(s"Invalid Output State: $state")
+class InvalidOutputStateException(message: String) extends Exception(message)
 
 
 /** An ADT representing the result of a pushing a message to write
 */
 sealed trait OutputResult
+sealed trait OutputError extends OutputResult {
+  def reason: Throwable
+}
 object OutputResult {
 
   // the message was successfully written
   case object Success extends OutputResult
 
   // the message failed while it was being written, most likely due to the connection closing partway
-  case class Failure(reason: Throwable) extends OutputResult
+  case class Failure(reason: Throwable) extends OutputResult with OutputError
 
   // the message was cancelled before it was written
-  case class Cancelled(reason: Throwable) extends OutputResult
+  case class Cancelled(reason: Throwable) extends OutputResult with OutputError
 }
 
 /**
@@ -73,48 +126,89 @@ object OutputResult {
 trait OutputController[Input, Output] extends MasterController[Input, Output] {
   import OutputState._
 
-  case class QueuedItem(item: Output, postWrite: OutputResult => Unit, creationTimeMillis: Long) {
-    def isTimedOut(now: Long) = controllerConfig.sendTimeout.isFinite && now > (creationTimeMillis + controllerConfig.sendTimeout.toMillis)
-  }
+  private[controller] var outputState: OutputState = Suspended
+  private var msgq = new MessageQueue[Output](controllerConfig.outputBufferSize)
 
-  private[controller] var outputState: OutputState = Dequeueing
-
-  //whether or not we should be pulling items out of the queue to write, this
-  //can be set to false through pauseWrites
+  //TODO : This functionality is only used for (and only makes sense) the
+  //ServiceClient.  It probably makes more sense to let ServiceClient do its own
+  //buffering
   private var _writesEnabled = true
-  def writesEnabled = _writesEnabled
 
-  //represents a message queued for writing
-  //the queue of items waiting to be written.
-  // this is intentionally a j.u.LinkedList instead of s.Queue for performance reasons
-  private val waitingToSend = new java.util.LinkedList[QueuedItem]
-
-  def queueSize = waitingToSend.size()
+  private var manualDisconnect = false
 
   private[controller] def outputOnConnected() {
-    _writesEnabled = true
+
     outputState = Dequeueing
-    checkQueue()
+    _writesEnabled = true
+
+    if (!msgq.isEmpty) {
+      signalWrite()
+    }
+
   }
+
+  protected def pendingBufferSize = msgq.size
 
   private[controller] def outputOnClosed() {
     val reason = new NotConnectedException("Connection Closed")
     outputState match {
-      case Streaming(source, post) => {
+      case Streaming(source, dataQ, post) => {
         source.terminate(reason)
-        post(OutputResult.Failure(reason))
-      }
-      case Writing(post) => {
         post(OutputResult.Failure(reason))
       }
       case _ => {}
     }
-    outputState = Terminated
+    if (manualDisconnect) {
+      while (!msgq.isEmpty) {
+        msgq.dequeue.postWrite(OutputResult.Cancelled(reason))
+      }
+
+      outputState = Terminated
+    } else {
+      outputState = Suspended
+    }
   }
 
+  /**
+   * handle the output side of gracefully disconnecting.  If the output
+   * controller is currently idle, we can immediately switch the state to
+   * Terminated, otherwise, we switch disconnecting to true and wait for pending
+   * messages to either get sent or timeout
+   */
   private[controller] def outputGracefulDisconnect() {
-    if (outputState == Dequeueing) {
+    manualDisconnect = true
+    outputState match {
+      case a : AliveOutputState => {
+        checkOutputGracefulDisconnect()
+      }
+      case other => {
+        val reason = new NotConnectedException("Connection Closed")
+        while (!msgq.isEmpty) {
+          msgq.dequeue.postWrite(OutputResult.Cancelled(reason))
+        }
+        outputState = Terminated
+      }
+    }
+  }
+
+
+  /**
+   * returns true if the state is switched to Terminated
+   */
+  private def checkOutputGracefulDisconnect(): Boolean = {
+    if (manualDisconnect && msgq.isEmpty && outputState == Dequeueing) {
       outputState = Terminated
+      checkControllerGracefulDisconnect()
+      true
+    } else false
+  }
+
+  private def signalWrite() {
+    connectionState match {
+      case a: AliveState => {
+        if (writesEnabled) a.endpoint.requestWrite()
+      }
+      case _ => {}
     }
   }
 
@@ -132,52 +226,55 @@ trait OutputController[Input, Output] extends MasterController[Input, Output] {
    *
    * @return true if the message was successfully enqueued, false if the queue is full
    */
-  protected def push(item: Output, createdMillis: Long = System.currentTimeMillis)(postWrite: OutputResult => Unit): Boolean = {
-    if (waitingToSend.size < controllerConfig.outputBufferSize) {
-      waitingToSend.add(QueuedItem(item, postWrite, createdMillis))
-      checkQueue()
+  protected def push(item: Output, createdMillis: Long = System.currentTimeMillis)(postWrite: QueuedItem.PostWrite): Boolean = {
+    if (canPush) {
+      if (msgq.size == 0 && outputState == Dequeueing) signalWrite()
+      msgq.enqueue(item, postWrite, createdMillis)
       true
     } else {
       false
     }
   }
 
-  /** Purge the outgoing message, if there is one
-   *
-   * If a message is currently being streamed, the stream will be terminated
-   */
-  protected def purgeOutgoing(reason: Throwable) {
+  protected def canPush = outputState.canPush && !msgq.isFull
+
+  private def drainSource(){
     outputState match {
-      case Writing(postWrite) => postWrite(OutputResult.Failure(reason))
-      case Streaming(source, post) => {
-        source.terminate(reason)
-        post(OutputResult.Failure(reason))
+      case Streaming(source, dataQ, post) => source.pull {
+        case Success(Some(data)) => {
+          if (dataQ.itemSize == 0) signalWrite()
+          dataQ.enqueue(data)
+          if (! dataQ.isFull) drainSource()
+        }
+        case Success(None) => {
+          //there's actually nothing to do here, switching back to the dequeuing
+          //state is handled in readyForData
+          if (!dataQ.isEmpty) signalWrite()
+        }
+        case Failure(err) => {
+          //todo: where to propagate the error?
+          disconnect()
+        }
       }
-      case _ => {}
-    }
-    outputState = state match {
-      case d: ConnectionState.Disconnecting => Terminated
-      case _ => Dequeueing
+      case other => throw new InvalidOutputStateException("Attempted to drain source when not in streaming state")
     }
   }
 
+
   /** Purge all pending messages
-   * 
+   *
    * If a message is currently being written, it is not affected
    */
   protected def purgePending(reason: Throwable) {
-    while (waitingToSend.size > 0) {
-      val q = waitingToSend.remove()
+    while (!msgq.isEmpty) {
+      val q = msgq.dequeue
       q.postWrite(OutputResult.Cancelled(reason))
     }
   }
 
-  /** Purge both pending and outgoing messages */
-  protected def purgeAll(reason: Throwable) {
-    purgeOutgoing(reason)
-    purgePending(reason)
-  }
+  protected def writesEnabled: Boolean = _writesEnabled
 
+  /** Purge both pending and outgoing messages */
   /**
    * Pauses writing of the next item in the queue.  If there is currently a
    * message in the process of writing, it will be unaffected.  New messages
@@ -192,111 +289,75 @@ trait OutputController[Input, Output] extends MasterController[Input, Output] {
    */
   protected def resumeWrites() {
     _writesEnabled = true
-    checkQueue()
+    if (!msgq.isEmpty) signalWrite()
   }
 
-  /*
-   * iterate through the queue and write items.  Writing non-streaming items is
-   * iterative whereas writing a stream enters drain, which will be recursive
-   * if the stream has multiple databuffers to immediately write
-   */
-  private def checkQueue() {
-    def go(endpoint: WriteEndpoint) {
-      while (_writesEnabled && outputState == Dequeueing && waitingToSend.size > 0) {
-        val queued = waitingToSend.remove()
-        codec.encode(queued.item) match {
-          case DataStream(sink) => {
-            outputState = Streaming(sink, queued.postWrite)
-            drain(sink)
-          }
-          case d: DataBuffer => endpoint.write(d) match {
-            case WriteStatus.Complete => {
-              queued.postWrite(OutputResult.Success)
+  def readyForData(buffer: DataOutBuffer) =  {
+    if (checkOutputGracefulDisconnect()) {
+      MoreDataResult.Complete
+    } else outputState match {
+      case Dequeueing => {
+        while (writesEnabled && outputState == Dequeueing && msgq.size > 0 && ! buffer.isOverflowed) {
+          val next = msgq.dequeue
+          codec.encode(next.item) match {
+            case e: Encoder => {
+              e.encode(buffer)
+              next.postWrite(OutputResult.Success)
             }
-            case WriteStatus.Failed | WriteStatus.Zero => {
-              //this probably shouldn't occur since we already check if the connection is writable
-              queued.postWrite(OutputResult.Failure(new Exception("Attempted to write to non-writable endpoint")))
-              //throw new Exception(s"Invalid write status")
-            }
-            case WriteStatus.Partial => {
-              outputState = Writing(queued.postWrite)
+            case DataStream(source) => {
+              outputState = Streaming(source, new DataQueue(1000), next.postWrite)
+              drainSource()
             }
           }
         }
       }
-    }
-    state match {
-      case a: AliveState if (waitingToSend.size > 0) => go(a.endpoint)
-      case d: ConnectionState.Disconnecting => {
-        outputState = Terminated
+      case ls @ Streaming(source, dataQ, post) => {
+        while (dataQ.itemSize > 0 && ! buffer.isOverflowed) {
+          dataQ.dequeue.encode(buffer)
+        }
+        if (dataQ.isEmpty) {
+          if (source.isClosed) {
+            //all done
+            post(OutputResult.Success)
+            outputState = Dequeueing
+          } else {
+            //ask for more
+            drainSource()
+          }
+        }
       }
       case _ => {}
     }
-    checkControllerGracefulDisconnect()
-  }
-      
 
-  /*
-   * keeps reading from a source until it's empty or writing a databuffer is
-   * incomplete.  Notice in the latter case we just wait for readyForData to be
-   * called and resume there
-   */
-  private def drain(source: Source[DataBuffer]) {
-    source.pull{
-      case Success(Some(data)) => state match {
-        case a: AliveState => a.endpoint.write(data) match {
-          case WriteStatus.Complete => drain(source)
-          case WriteStatus.Failed  => {
-            source.terminate(new NotConnectedException("Connection closed during streaming"))
-          }
-          case WriteStatus.Zero => {
-            throw new Exception("Invalid write status")
-          }
-          case WriteStatus.Partial =>{} //don't do anything, draining will resume in readyForData
-        }
-        case other => {
-          source.terminate(new NotConnectedException("Connection closed during streaming"))
-        }
-      }
-      case Success(None) => outputState match {
-        case Streaming(s, postWrite) => {
-          postWrite(OutputResult.Success)
-          outputState = Dequeueing
-          checkQueue()
-        }
-        case other => throw new InvalidOutputStateException(other)
-      }
-      case Failure(err) => {
-        //if we can't finish writing the current stream, not much else we can
-        //do except close the connection
-        throw err
-      }
-    }
-  }
-
-  /*
-   * If we're currently streaming, resume the stream, otherwise when this is
-   * called it means a non-stream item has finished fully writing, so we can go
-   * back to checking the queue
-   */
-  def readyForData() {
     outputState match {
-      case Streaming(sink, post) => drain(sink)
-      case Writing(post) => {
-        post(OutputResult.Success)
-        outputState = Dequeueing
-        checkQueue()
+      case Dequeueing => {
+        if (manualDisconnect || (writesEnabled && msgq.size > 0)) {
+          //return incomplete only if we overflowed the buffer and have more
+          //in the queue, or if disconnecting to finish the disconnect
+          //process
+          MoreDataResult.Incomplete
+        } else {
+          MoreDataResult.Complete
+        }
       }
-      case other => throw new InvalidOutputStateException(other)
+      case Streaming(_, dataQ, _) => {
+        if (manualDisconnect || !dataQ.isEmpty) {
+          MoreDataResult.Incomplete
+        } else {
+          MoreDataResult.Complete
+        }
+      }
+      case _ => MoreDataResult.Complete
     }
   }
 
-  def idleCheck(period: Duration): Unit = {
+  def idleCheck(period: FiniteDuration): Unit = {
     val time = System.currentTimeMillis
-    while (waitingToSend.size > 0 && waitingToSend.peek.isTimedOut(time)) {
-      val expired = waitingToSend.removeFirst()
+    while (!msgq.isEmpty && msgq.head.isTimedOut(time, controllerConfig.sendTimeout)) {
+      val expired = msgq.dequeue
       expired.postWrite(OutputResult.Cancelled(new RequestTimeoutException))
     }
   }
 
 }
+

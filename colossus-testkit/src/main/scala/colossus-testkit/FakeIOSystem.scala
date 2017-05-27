@@ -5,16 +5,18 @@ import core._
 import metrics._
 import service._
 
+import akka.agent.Agent
 import akka.actor._
 import akka.testkit.TestProbe
-import akka.testkit.CallingThreadDispatcher
 
-import scala.concurrent.{Await, ExecutionContext, Future, Promise}
+import scala.concurrent.{Await, Promise}
 import scala.concurrent.duration._
+
+case class FakeWorker(probe: TestProbe, worker: WorkerRef)
 
 object FakeIOSystem {
   def apply()(implicit system: ActorSystem): IOSystem = {
-    IOSystem(system.deadLetters, IOSystemConfig("FAKE", 0), MetricSystem.deadSystem, system)
+    new IOSystem("FAKE", 0, MetricSystem.deadSystem, system, (x,y) => system.deadLetters)
   }
 
   /**
@@ -25,7 +27,27 @@ object FakeIOSystem {
   def fakeWorkerRef(implicit system: ActorSystem): (TestProbe, WorkerRef) = {
     val probe = TestProbe()
     implicit val aref = probe.ref
-    val ref = WorkerRef(0, new LocalCollection, probe.ref, apply())
+    val ref = WorkerRef(0, probe.ref, apply())
+    (probe, ref)
+  }
+  //use this for new tests
+  def fakeWorker(implicit system: ActorSystem) = {
+    val (p, w) = fakeWorkerRef
+    FakeWorker(p, w)
+  }
+
+  /**
+   * Returns a ServerRef representing a server in the Bound state
+   */
+  def fakeServerRef(implicit system: ActorSystem): (TestProbe, ServerRef) = {
+    import system.dispatcher
+    val probe = TestProbe()
+    val config = ServerConfig(
+      "/foo",
+      (s,w) => ???,
+      ServerSettings(987)
+    )
+    val ref = ServerRef(config, probe.ref, apply(), Agent(ServerState(ConnectionVolumeState.Normal, ServerStatus.Bound)))
     (probe, ref)
   }
 
@@ -34,12 +56,12 @@ object FakeIOSystem {
    */
   def fakeExecutorWorkerRef(implicit system: ActorSystem): WorkerRef = {
     val ex = testExecutor
-    WorkerRef(0, new LocalCollection, testExecutor.executor, FakeIOSystem())
+    WorkerRef(0, testExecutor.executor, FakeIOSystem())
   }
 
   def withManagerProbe()(implicit system: ActorSystem): (IOSystem, TestProbe) = {
     val probe = TestProbe()
-    val sys = IOSystem(probe.ref, IOSystemConfig("FAKE", 0), MetricSystem.deadSystem, system)
+    val sys = new IOSystem("FAKE", 0, MetricSystem.deadSystem, system, (x,y) => probe.ref)
     (sys, probe)
   }
 
@@ -74,7 +96,6 @@ class GenericExecutor extends Actor with CallbackExecution {
     }
   }
 }
-
 
 object CallbackAwait {
 

@@ -1,37 +1,58 @@
 package colossus
 package protocols.http
 
-import akka.util.ByteString
-
-import core.DataBuffer
+import core.DataOutBuffer
 import parsing._
+import Combinators._
 import DataSize._
-import HttpParse._
 
 object HttpRequestParser {
-  import Combinators._
+  import HttpParse._
 
-  val DefaultMaxSize: DataSize = 1.MB
+  def apply() = httpRequest
 
-  def apply(size: DataSize = DefaultMaxSize) = maxSize(size, httpRequest)
-
-  protected def httpRequest: Parser[HttpRequest] = httpHead |> {head => 
-    head.singleHeader(HttpHeaders.TransferEncoding) match { 
-      case None | Some("identity") => head.contentLength match {
-        case Some(0) | None => const(HttpRequest(head, None))
-        case Some(n) => bytes(n) >> {body => HttpRequest(head, Some(body))}
+  //TODO : don't parse body as a bytestring
+  protected def httpRequest: Parser[HttpRequest] = httpHead |> {head =>
+    head.headers.transferEncoding match {
+      case TransferEncoding.Identity => head.headers.contentLength match {
+        case Some(0) | None => const(HttpRequest(head, HttpBody.NoBody))
+        case Some(n) => bytes(n, 1000.MB, 1.KB) >> {body => HttpRequest(head, new HttpBody(body))}
       }
-      case Some(other)  => chunkedBody >> {body => HttpRequest(head, Some(body))}
-    } 
+      case other  => chunkedBody >> {body => HttpRequest(head, HttpBody(body))}
+    }
   }
 
-  protected def httpHead = firstline ~ headers >> {case method ~ path ~ version ~ headers => 
-    HttpHead(HttpMethod(method), path, HttpVersion(version), headers)
+  protected def httpHead = firstLine ~ headers >> {case fl ~ headersBuilder =>
+    ParsedHead(fl, headersBuilder.buildHeaders)
   }
-  
-  protected def firstline  = stringUntil(' ', minSize = Some(1), allowWhiteSpace = false) ~ 
-    stringUntil(' ', minSize = Some(1), allowWhiteSpace = false) ~ 
-    stringUntil('\r', minSize = Some(1), allowWhiteSpace = false) <~ byte
+
+  def firstLine = line(ParsedFL.apply, true)
+
 }
+
+
+case class ParsedFL(data: Array[Byte]) extends FirstLine with LazyParsing {
+
+  protected def parseErrorMessage = "Malformed head"
+
+
+  def encode(out: DataOutBuffer) {
+    out.write(data)
+  }
+  lazy val method     = parsed {HttpMethod(data)}
+
+  //private lazy val pathStart  = fastIndex(data, ' '.toByte, 3) + 1
+  private def pathStart = method.encodedSize + 1
+  private def pathLength = data.length - 11 - pathStart //assumes the line ends with " HTTP/x/x\r\n", which it always should
+
+  lazy val path       = parsed { new String(data, pathStart, pathLength) }
+  lazy val version    = parsed {
+    val vstart = data.length - 10
+    HttpVersion(data, vstart, data.length - vstart - 2)
+  }
+}
+
+
+
 
 

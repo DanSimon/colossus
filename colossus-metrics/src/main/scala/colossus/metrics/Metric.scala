@@ -1,21 +1,19 @@
 package colossus.metrics
 
-import scala.util.Try
-
 trait MetricFormatter[T] {
   def format(m: MetricFragment, timestamp: Long): T
 }
 
-object OpenTsdbFormatter extends MetricFormatter[String] { 
+object OpenTsdbFormatter extends MetricFormatter[String] {
 
   def formatTags(t: TagMap) = t.map{case (k,v) => k + "=" + v}.mkString(" ")
 
-  def format(m: MetricFragment, timestamp: Long): String = s"put ${m.address.pieceString} $timestamp ${m.value} ${formatTags(m.tags)}\n" 
+  def format(m: MetricFragment, timestamp: Long): String = s"put ${m.address.pieceString} $timestamp ${m.value} ${formatTags(m.tags)}\n"
 }
 
 
 case class MetricAddress(components: List[String]) {
-  def /(c: String): MetricAddress = copy(components = components :+ c)//.toLowercase removed for backwards compatability
+  def /(c: String): MetricAddress = /(MetricAddress(c))
 
   def /(m: MetricAddress): MetricAddress = copy(components = components ++ m.components)
 
@@ -24,6 +22,11 @@ case class MetricAddress(components: List[String]) {
   def pieceString = components.mkString("/")
 
   def idString = components.mkString("_")
+
+  /**
+   * String version the address used for loading configuration
+   */
+  def configString = components.mkString(".")
 
   def tail = copy(components.tail)
   def head = components.head
@@ -34,6 +37,9 @@ case class MetricAddress(components: List[String]) {
    * /foo/bar matches /foo/bar but not /foo/bar/baz
    * /foo/ * matches foo/bar and foo/bar/baz
    * /foo/ * /baz matches foo/bar/baz but not foo/bar
+   *
+   * PS: This is not commutative
+   * @param address MetricAddress the address being checked
    */
   def matches(address: MetricAddress): Boolean = {
     def next(mine: List[String], theirs: List[String], lastWasWC: Boolean = false): Boolean = (mine.headOption, theirs.headOption) match {
@@ -58,28 +64,23 @@ case class MetricAddress(components: List[String]) {
 object MetricAddress {
   val Root = MetricAddress(Nil)
 
-  def fromString(str: String): Try[MetricAddress] = Try {
-    if (str == "/") MetricAddress.Root else {
-      val pieces = str.split("/")
-      if (pieces(0) != "") {
-        throw new IllegalArgumentException("Address must start with leading /")
+  def fromString(str: String): MetricAddress = {
+    str match {
+      case "" | "/" => MetricAddress.Root
+      case _ => {
+        val s = if (str startsWith "/") str else "/" + str
+        val pieces = s.split("/")
+        MetricAddress(pieces.toList.tail)
       }
-      MetricAddress(pieces.toList.tail)
     }
   }
 
-  def apply(str: String) = fromString(str).get
+  def apply(str: String) = fromString(str)
 
-  implicit def string2Address(s: String) : MetricAddress = fromString(if (s startsWith "/") s else "/" + s).get
+  implicit def string2Address(s: String) : MetricAddress = fromString(s)
 
 }
 
-case class MetricFragment(address: MetricAddress, tags: TagMap, value: RawMetricValue)
+case class MetricFragment(address: MetricAddress, tags: TagMap, value: MetricValue)
 
 
-/**
- * Anything that eventually expands to a set of raw stats extends this
- */
-trait MetricProducer {
-  def metrics(context: CollectionContext): MetricMap
-}

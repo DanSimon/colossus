@@ -1,5 +1,7 @@
 package colossus
+package service
 
+import core.Server
 import testkit._
 
 import akka.actor._
@@ -7,30 +9,28 @@ import akka.testkit.TestProbe
 import akka.util.ByteString
 
 import scala.concurrent.duration._
-import scala.concurrent.Await
+import scala.concurrent.{Await, Future}
 
-import protocols.telnet._
-import service._
 import Callback.Implicits._
 
 import RawProtocol.{RawCodec, Raw}
 
-class ErrorTestDSL(probe: ActorRef) extends CodecProvider[Raw] {
+class ErrorTestDSL(probe: ActorRef) extends ServiceCodecProvider[Raw] {
 
     def provideCodec() = RawCodec
 
-    def errorResponse(request: ByteString, reason: Throwable) = {
-      probe ! reason
-      ByteString(s"Error (${reason.getClass.getName}): ${reason.getMessage}")
+    def errorResponse(error: ProcessingFailure[ByteString]) = {
+      probe ! error.reason
+      ByteString(s"Error (${error.reason.getClass.getName}): ${error.reason.getMessage}")
     }
-  
 }
-
-
 
 class ServiceDSLSpec extends ColossusSpec {
 
   "Service DSL" must {
+
+    /**
+     * TODO: move to Server DSL tests
     "receive delegator messages" in {
       withIOSystem{implicit system =>
         val probe = TestProbe()
@@ -47,12 +47,13 @@ class ServiceDSLSpec extends ColossusSpec {
         probe.expectMsg(250.milliseconds, "PONG")
       }
     }
+    */
 
     "throw UnhandledRequestException on unhandled request" in {
-      val probe = TestProbe() 
+      val probe = TestProbe()
       implicit val provider = new ErrorTestDSL(probe.ref)
-      withIOSystem{ implicit system => 
-        val server = Service.become[Raw]("test", TEST_PORT) { 
+      withIOSystem{ implicit system =>
+        val server = Service.basic[Raw]("test", TEST_PORT) {
           case any if (false) => ByteString("WAT")
         }
         withServer(server) {
@@ -66,21 +67,22 @@ class ServiceDSLSpec extends ColossusSpec {
     "receive connection messages" in {
       val probe = TestProbe()
       withIOSystem{ implicit system =>
-        val server = Service.serve[Raw]("test", TEST_PORT) { context =>
-          context.handle{ connection =>
-            connection.receive{
+        val server = Server.basic("test", TEST_PORT)(new Service[Raw](_) {
+            override def receive = {
               case "PING" => {
                 probe.ref ! "PONG"
               }
             }
-            connection.become{
+            def handle = {
               case x if (x == ByteString("PING")) => {
-                context.worker.worker ! core.WorkerCommand.Message(connection.connectionInfo.get.id, "PING")
+                connectionHandle.foreach{ h =>
+                  h.worker.worker ! core.WorkerCommand.Message(h.id, "PING")
+                }
                 Callback.successful(ByteString("WHATEVER"))
               }
             }
           }
-        }
+        )
         withServer(server) {
           val client = TestClient(system, TEST_PORT)
           client.send(ByteString("PING"))
@@ -91,16 +93,15 @@ class ServiceDSLSpec extends ColossusSpec {
 
     "override error handler" in {
       withIOSystem{ implicit system =>
-        val server = Service.serve[Raw]("test", TEST_PORT) { context =>
-          context.handle{ connection => 
-            connection.onError{
-              case (request, c: UnhandledRequestException) => ByteString("OVERRIDE")
+        val server = Server.basic("test", TEST_PORT)( new Service[Raw](_) {
+            override def onError = {
+              case error => ByteString("OVERRIDE")
             }
-            connection.become{
+            def handle = {
               case x if (false) => ByteString("NOPE")
             }
           }
-        }
+        )
         withServer(server) {
           val client = TestClient(system, TEST_PORT)
           Await.result(client.send(ByteString("TEST")), 1.second).utf8String must equal("OVERRIDE")
@@ -108,6 +109,28 @@ class ServiceDSLSpec extends ColossusSpec {
       }
     }
 
+    "be able to create two clients of differing codecs" in {
+      withIOSystem{ implicit sys =>
+        import protocols.http._
+        import protocols.memcache._
+        import Http.defaults._
+        import Memcache.defaults._
+        //this test passes if it compiles
+        val s = Http.futureClient("localhost", TEST_PORT, 1.second)
+        val t = Memcache.futureClient("localhost", TEST_PORT, 1.second)
+      }
+    }
+
+    "be able to lift a sender to a type-specific client" in {
+      withIOSystem{ implicit sys =>
+        import protocols.http._
+        import Http.defaults._
+
+        val s = FutureClient[Http]("localhost", TEST_PORT, 1.second)
+        val t = Http.futureClient(s)
+        val q : HttpClient[Future] = t
+      }
+    }
   }
 }
 

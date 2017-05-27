@@ -1,12 +1,14 @@
 package colossus
 package controller
 
+import colossus.metrics.Histogram
+import colossus.parsing.ParserSizeTracker
 import core._
 import colossus.service.{DecodedResult, NotConnectedException}
 
 sealed trait InputState
 object InputState {
-  
+
   /**
    * The controller is waiting for more data to begin or continue decoding a message
    */
@@ -43,7 +45,7 @@ class InvalidInputStateException(state: InputState) extends Exception(s"Invalid 
  * - Terminating the stream at any point kills the connection
  * - Closing a stream outside of a pull callback will kill the connection without logging the error
  * - Closing a stream inside of a pull callback will complete the stream and the controller will resset
- * 
+ *
  */
 trait InputController[Input, Output] extends MasterController[Input, Output] {
   import InputState._
@@ -54,6 +56,15 @@ trait InputController[Input, Output] extends MasterController[Input, Output] {
   //maybe not
   private var _readsEnabled = true
   def readsEnabled = _readsEnabled
+
+
+  //this has to be lazy to avoid initialization-order NPE
+  lazy val inputSizeHistogram = if (controllerConfig.metricsEnabled) {
+    Some(Histogram("input_size", sampleRate = 0.10, percentiles = List(0.75,0.99)))
+  } else {
+    None
+  }
+  lazy val inputSizeTracker = new ParserSizeTracker(Some(controllerConfig.inputMaxSize), inputSizeHistogram)
 
   private[controller] def inputOnClosed() {
     inputState match {
@@ -83,6 +94,7 @@ trait InputController[Input, Output] extends MasterController[Input, Output] {
 
   private[controller] def inputOnConnected() {
     _readsEnabled = true
+    resumeReads()
     inputState = Decoding
   }
 
@@ -94,7 +106,7 @@ trait InputController[Input, Output] extends MasterController[Input, Output] {
   }
 
   protected def pauseReads() {
-    state match {
+    connectionState match {
       case a : AliveState => {
         _readsEnabled = false
         a.endpoint.disableReads()
@@ -104,7 +116,7 @@ trait InputController[Input, Output] extends MasterController[Input, Output] {
   }
 
   protected def resumeReads() {
-    state match {
+    connectionState match {
       case a: AliveState => {
         _readsEnabled = true
         a.endpoint.enableReads()
@@ -125,25 +137,32 @@ trait InputController[Input, Output] extends MasterController[Input, Output] {
       case Decoding => {
         var decoding = true
         while (decoding) {
-          codec.decode(data) match {
-            case Some(DecodedResult.Static(msg)) => {
-              processMessage(msg)
+          try {
+            inputSizeTracker.track(data)(codec.decode(data)) match {
+              case Some(DecodedResult.Static(msg)) => {
+                processMessage(msg)
+              }
+              case None => {
+                decoding = false
+              }
+              case Some(DecodedResult.Stream(msg, sink)) => {
+                decoding = false
+                inputState = ReadingStream(sink)
+                processAndContinue(msg, data)
+              }
             }
-            case None => {
+          } catch {
+            case reason: Throwable => {
               decoding = false
-            } 
-            case Some(DecodedResult.Stream(msg, sink)) => {
-              decoding = false
-              inputState = ReadingStream(sink)
-              processAndContinue(msg, data)
+              fatalInputError(reason)
             }
           }
         }
       }
       case ReadingStream(sink) => sink.push(data) match {
         case PushResult.Ok => {}
-        case PushResult.Complete => state match{
-          case ConnectionState.Disconnecting(_) => {
+        case PushResult.Complete => connectionState match{
+          case ConnectionState.ShuttingDown(_) => {
             //gracefulDisconnect was called, so we allowed the connection to
             //finish reading in the stream, but now that it's done, disable
             //reads and drop any data still in the buffer
@@ -156,7 +175,7 @@ trait InputController[Input, Output] extends MasterController[Input, Output] {
           }
           case other => throw new InvalidConnectionStateException(other)
         }
-        case PushResult.Full(trigger) => state match {
+        case PushResult.Full(trigger) => connectionState match {
           case a: AliveState => {
             a.endpoint.disableReads()
             val copied = data.takeCopy
@@ -169,10 +188,10 @@ trait InputController[Input, Output] extends MasterController[Input, Output] {
           }
           case other => throw new InvalidConnectionStateException(other)
         }
-        case PushResult.Filled(trigger) => state match {
+        case PushResult.Filled(trigger) => connectionState match {
           case a: AliveState => {
             a.endpoint.disableReads()
-            trigger.fill{() => 
+            trigger.fill{() =>
               resumeReads()
               inputState = ReadingStream(sink)
             }
@@ -196,7 +215,10 @@ trait InputController[Input, Output] extends MasterController[Input, Output] {
     }
   }
 
+  protected def fatalInputError(reason: Throwable)
 
   protected def processMessage(message: Input)
+
+  protected def processBadRequest(reason: Throwable): Option[Output] = None
 
 }

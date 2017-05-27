@@ -5,6 +5,9 @@ import akka.util.ByteString
 import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 
+
+
+
 /**
  * A DataReader is the result of codec's encode operation.  It can either
  * return a DataBuffer, which contains the entire encoded object at once, or it
@@ -14,6 +17,16 @@ sealed trait DataReader
 
 case class DataStream(source: controller.Source[DataBuffer]) extends DataReader
 
+trait Encoder extends DataReader{
+  def encode(out: DataOutBuffer)
+
+  def bytes: ByteString = {
+    val out = new DynamicOutBuffer(100, false)
+    encode(out)
+    ByteString(out.data.takeAll)
+  }
+}
+
 /** A thin wrapper around a NIO ByteBuffer with data to read
  *
  * DataBuffers are the primary way that data is read from and written to a
@@ -21,7 +34,7 @@ case class DataStream(source: controller.Source[DataBuffer]) extends DataReader
  * read from once and cannot be reset.
  *
  */
-case class DataBuffer(data: ByteBuffer) extends DataReader {
+case class DataBuffer(data: ByteBuffer) extends Encoder {
   /** Get the next byte, removing it from the buffer
    *
    * WARNING : This method will throw an exception if no data is left.  It is
@@ -33,6 +46,10 @@ case class DataBuffer(data: ByteBuffer) extends DataReader {
   def next(): Byte = data.get
 
   private var peeking = false
+
+  def encode(out: DataOutBuffer) {
+    out.write(this)
+  }
 
 
   /** Get some bytes
@@ -126,7 +143,7 @@ case class DataBuffer(data: ByteBuffer) extends DataReader {
     peeking = false
     (res, pos2 - pos1)
   }
-    
+
 }
 
 object DataBuffer {

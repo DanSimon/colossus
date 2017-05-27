@@ -12,21 +12,19 @@ trait TagGenerator {
 
 /**
  * Configuration class for the metric reporter
- * @param metricAddress The MetricAddress of the MetricSystem that this reporter is a member
  * @param metricSenders A list of [[MetricSender]] instances that the reporter will use to send metrics
  * @param globalTags
  * @param filters
  * @param includeHostInGlobalTags
  */
 case class MetricReporterConfig(
-  metricAddress: MetricAddress,
   metricSenders: Seq[MetricSender],
   globalTags: Option[TagGenerator] = None,
   filters: MetricReporterFilter = MetricReporterFilter.All,
   includeHostInGlobalTags: Boolean = true
 )
 
-class MetricReporter(intervalAggregator : ActorRef, config: MetricReporterConfig) extends Actor with ActorLogging{
+class MetricReporter(intervalAggregator : ActorRef, config: MetricReporterConfig, metricSystemName: String) extends Actor with ActorLogging{
   import MetricReporter._
   import config._
 
@@ -37,13 +35,11 @@ class MetricReporter(intervalAggregator : ActorRef, config: MetricReporterConfig
     case _: Exception                => Restart
   }
 
-  private val strippedAddress = metricAddress.toString.replace("/", "")
-
-  private def createSender(sender : MetricSender) = context.actorOf(sender.props, name = s"$strippedAddress-${sender.name}-sender")
+  private def createSender(sender : MetricSender) = context.actorOf(sender.props, name = s"$metricSystemName-${sender.name}-sender")
 
   private var reporters = Seq[ActorRef]()
 
-  private val compiledGlobalTags = {
+  private def compiledGlobalTags() = {
     val userTags = globalTags.map{_.tags}.getOrElse(Map())
     val added = if (includeHostInGlobalTags) Map("host" -> localHostname) else Map()
     userTags ++ added
@@ -52,7 +48,7 @@ class MetricReporter(intervalAggregator : ActorRef, config: MetricReporterConfig
   def receive = {
 
     case ReportMetrics(m) => {
-      val s = MetricSender.Send(filterMetrics(m), compiledGlobalTags, System.currentTimeMillis())
+      val s = MetricSender.Send(filterMetrics(m), compiledGlobalTags(), System.currentTimeMillis())
       sendToReporters(s)
     }
     case ResetSender => {
@@ -62,15 +58,11 @@ class MetricReporter(intervalAggregator : ActorRef, config: MetricReporterConfig
     }
   }
 
-  private def filterMetrics(m : MetricMap) : RawMetricMap = {
+  private def filterMetrics(m : MetricMap) : MetricMap = {
     filters match {
-      case MetricReporterFilter.All => m.toRawMetrics
-      case MetricReporterFilter.WhiteList(x) => {
-        m.filterKeys(x.contains).toRawMetrics
-      }
-      case MetricReporterFilter.BlackList(x) => {
-        m.filterKeys(k => !x.contains(k)).toRawMetrics
-      }
+      case MetricReporterFilter.All => m
+      case MetricReporterFilter.WhiteList(x) => m.filterKeys(k => x.exists(_.matches(k)))
+      case MetricReporterFilter.BlackList(x) => m.filterKeys(k => !x.exists(_.matches(k)))
     }
   }
 
@@ -87,8 +79,8 @@ class MetricReporter(intervalAggregator : ActorRef, config: MetricReporterConfig
 object MetricReporter {
   case object ResetSender
 
-  def apply(config: MetricReporterConfig, intervalAggregator : ActorRef)(implicit fact: ActorRefFactory): ActorRef = {
-    fact.actorOf(Props(classOf[MetricReporter], intervalAggregator, config))
+  def apply(config: MetricReporterConfig, intervalAggregator : ActorRef, name: String)(implicit fact: ActorRefFactory): ActorRef = {
+    fact.actorOf(Props(classOf[MetricReporter], intervalAggregator, config, name))
   }
 
 }
@@ -99,7 +91,7 @@ trait MetricSender {
 }
 
 object MetricSender {
-  case class Send(metrics: RawMetricMap, globalTags: TagMap, timestamp: Long) {
+  case class Send(metrics: MetricMap, globalTags: TagMap, timestamp: Long) {
     def fragments = metrics.fragments(globalTags)
   }
 }

@@ -8,6 +8,7 @@ import Combinators._
 import org.scalatest._
 
 import akka.util.ByteString
+import DataSize._
 
 
 class CombinatorSuite extends WordSpec with MustMatchers{
@@ -18,21 +19,30 @@ class CombinatorSuite extends WordSpec with MustMatchers{
   "parsers" must {
     "bytes" in {
       val d = data("abcdefg")
-      val parser = bytes(3)
+      val parser = bytes(3).asByteString
       parser.parse(d) must equal (Some(bstr("abc")))
       parser.parse(d) must equal (Some(bstr("def")))
       parser.parse(d) must equal (None)
     }
     "bytes holds state" in {
-      val parser = bytes(3)
+      val parser = bytes(3).asByteString
       parser.parse(data("ab")) must equal (None)
       parser.parse(data("cd")) must equal (Some(bstr("abc")))
     }
     "bytes with parser" in {
-      val parser = bytes(intUntil(':'))
+      val parser = bytes(intUntil(':').map{_.toInt}).asByteString
       val d = data("12:abcdefghijklmn")
       parser.parse(d) must equal (Some(bstr("abcdefghijkl")))
     }
+    "bytes rejects sizes too large" in {
+      intercept[ParseException] {
+        val parser = bytes(5000, 1.KB, 1.KB)
+      }
+    }
+    "bytes respects init size" in {
+      val parser = bytes(Int.MaxValue, Int.MaxValue.bytes, 5.bytes)
+    }
+
     "const is const" in {
       val d = data("abcdefg")
       val parser = const(1)
@@ -41,12 +51,12 @@ class CombinatorSuite extends WordSpec with MustMatchers{
       parser.endOfStream() must equal (Some(1))
     }
     "repeat" in {
-      val parser = repeat(3, bytes(2))
+      val parser = repeat(3, bytes(2).asByteString)
       val d = data("abcdefgh")
       parser.parse(d) must equal (Some(Vector(bstr("ab"), bstr("cd"), bstr("ef"))))
     }
     "repeatUntil" in {
-      val parser = repeatUntil(bytes(2), '!')
+      val parser = repeatUntil(bytes(2).asByteString, '!')
       val d = data("abcdef!")
       parser.parse(d) must equal (Some(Vector(bstr("ab"), bstr("cd"), bstr("ef"))))
     }
@@ -99,7 +109,7 @@ class CombinatorSuite extends WordSpec with MustMatchers{
       }
     }
     "bytesUntil" in {
-      val parser = bytesUntil(ByteString("iii"))
+      val parser = bytesUntil(ByteString("iii").toArray).asByteString
       val d = data("xxxiixxxiiixxx")
       parser.parse(d) must equal(Some(ByteString("xxxiixxx")))
     }
@@ -176,58 +186,111 @@ class CombinatorSuite extends WordSpec with MustMatchers{
     }
 
     "EOS with pairing" in {
-      val parser = bytes(3) ~> repeatUntilEOS(bytes(2))
+      val parser = bytes(3) ~> repeatUntilEOS(bytes(2).asByteString)
       val d1 = ByteString("aaabbccdd")
       val expected = Some(Vector(ByteString("bb"), ByteString("cc"), ByteString("dd")))
       parser.parse(DataBuffer(d1)) must equal(None)
       parser.endOfStream() must equal(expected)
     }
-      
+
+    "line" in {
+      val parser = line
+      parser.parse(DataBuffer(Array[Byte](1, 2))) must equal(None)
+      parser.parse(DataBuffer(Array[Byte](3, 4, 13, 10, 5))).map{_.toSeq} must equal(Some(Array[Byte](1, 2, 3, 4).toSeq))
+    }
+
+    "line (split at the newline)" in {
+      val parser = line(false)
+      parser.parse(DataBuffer(Array[Byte](1, 2, 13))) must equal(None)
+      parser.parse(DataBuffer(Array[Byte](10, 4))).map{_.toSeq} must equal(Some(Array[Byte](1,2).toSeq))
+
+      parser.parse(DataBuffer(Array[Byte](1, 2))) must equal(None)
+      parser.parse(DataBuffer(Array[Byte](13, 10, 4))).map{_.toSeq} must equal(Some(Array[Byte](1,2).toSeq))
+
+    }
+
+    "line (include newline)" in {
+      val parser = line(true)
+      parser.parse(DataBuffer(Array[Byte](1, 2))) must equal(None)
+      parser.parse(DataBuffer(Array[Byte](3, 4, 13, 10, 5))).map{_.toSeq} must equal(Some(Array[Byte](1, 2, 3, 4, 13, 10).toSeq))
+    }
+
+    "line (grow internal buffer" in {
+      val parser = new LineParser(x => x, internalBufferBaseSize = 2)
+      val buf = data("abcdefghijklmnop\r\n123456")
+      val expected = ByteString("abcdefghijklmnop").toArray.toSeq
+      parser.parse(buf).get.toSeq must equal(expected)
+      buf.remaining must equal(6)
+    }
+
+    "line rejects isolated \\r" in {
+      val parser = line(true)
+      val buf = data("hello\ruhoh\r\n")
+      intercept[ParseException] {
+        parser.parse(buf)
+      }
+    }
+
+
 
 
   }
 
   "combinators" must {
     "combine basic" in {
-      val parser = bytes(3) ~ bytes(4)
+      val parser = bytes(3).asByteString ~ bytes(4).asByteString
       val d = data("123abcd")
       parser.parse(d) must equal (Some(new ~(bstr("123"), bstr("abcd"))))
     }
 
     "combine more complex parsers" in {
-      val parser = bytes(3) ~ repeat(2, bytes(3)) ~ bytes(4)
+      val parser = bytes(3).asByteString ~ repeat(2, bytes(3).asByteString) ~ bytes(4).asByteString
       val d = data("123x00x11abcd")
       val expected = new ~(new ~(bstr("123"), Vector(bstr("x00"), bstr("x11"))), bstr("abcd"))
       parser.parse(d) must equal(Some(expected))
     }
 
     "map" in {
-      val parser = bytes(3) ~ bytes(4) >> {case a ~ b => (a.utf8String, b.utf8String)}
+      val parser = bytes(3) ~ bytes(4) >> {case a ~ b => (ByteString(a).utf8String, ByteString(b).utf8String)}
       val d = data("123abcd")
       parser.parse(d) must equal (Some(("123", "abcd")))
     }
 
     "repeat - fixed" in {
-      val parser = repeat(3, bytes(2))
+      val parser = repeat(3, bytes(2).asByteString)
       val d = data("aabbccdd")
       parser.parse(d) must equal (Some(Vector(ByteString("aa"), ByteString("bb"), ByteString("cc"))))
     }
     "repeat - dynamic" in {
-      val parser = repeat(intUntil(':'), bytes(2))
+      val parser = repeat(intUntil(':'), bytes(2).asByteString)
       val d = data("3:aabbccdd")
       parser.parse(d) must equal (Some(Vector(ByteString("aa"), ByteString("bb"), ByteString("cc"))))
     }
 
     "repeatUntilEOS" in {
-      val parser = repeatUntilEOS(bytes(2))
+      val parser = repeatUntilEOS(bytes(2).asByteString)
       val d1 = data("aabb")
       val d2 = data("cc")
       parser.parse(d1) must equal(None)
       parser.parse(d2) must equal(None)
       parser.endOfStream() must equal(Some(Vector(ByteString("aa"), ByteString("bb"), ByteString("cc"))))
     }
+
+    "repeatZero" in {
+      implicit val bZero = new Zero[Byte] {
+        def isZero(b: Byte) = b == 123
+      }
+      val data1 = DataBuffer(ByteString(3,2))
+      val data2 = DataBuffer(ByteString(1, 123, 4))
+      val parser = repeatZero(byte)
+      val expected = Seq(3, 2, 1)
+      parser.parse(data1) must equal(None)
+      data1.remaining must equal(0)
+      parser.parse(data2).get.toSeq must equal(expected)
+      data2.remaining must equal(1)
+    }
   }
 
 }
-      
+
 

@@ -1,21 +1,37 @@
 language: scala
 scala:
-- 2.10.4
+- 2.10.6
 - 2.11.7
 jdk: oraclejdk7
 sudo: false
 services:
 - memcached
 - redis
-script: if [ "$TRAVIS_SCALA_VERSION" = "2.10.4" ]; then sbt ++$TRAVIS_SCALA_VERSION testAll; else sbt ++$TRAVIS_SCALA_VERSION clean coverage testAll && sbt coverageReport && sbt coverageAggregate; fi
-
+cache:
+  directories:
+  - $HOME/.ivy2/cache
+  - $HOME/.sbt/boot/
+script:
+- if [ "$TRAVIS_SCALA_VERSION" = "2.10.6" ]; then sbt ++$TRAVIS_SCALA_VERSION testAll;
+  else sbt ++$TRAVIS_SCALA_VERSION clean coverage testAll && sbt coverageReport &&
+  sbt coverageAggregate; fi
+- find $HOME/.sbt -name "*.lock" | xargs rm
+- find $HOME/.ivy2 -name "ivydata-*.properties" | xargs rm
 env:
   global:
-  - secure: izNeghOzB8Z5m0j24XhqCVlAhgs56p10l6pR2DtotKC7Q7rSfunLH3YF+8ijBkxFBNocnb0/XWbCWOhFOpje+gogIkYNGwZkxAKRAIifWf/+w4fMoqpid+q9kQZYRT5Iv+lm1YEC3PxhwPKQWe+fhfjPE21YNY6XIaUyQ4p8kXA=
-  - secure: KOt7FSG8FckBl49tfassG/fQKFMSAU/Xaz83UvEY0oAnFBbBSuSR/OkUd6NAHxFy/RotFsVoAxed8NgL8Nh7nsut3clXmhXuxhWsIOpR+q4wWrqA7KG+Fw4Q3SUsrICKGm92LnVsTeHKQ57qZ3mQaV/j/srmc+mrbi2kIYdmpFk=
-  - secure: JjPl0W+YTRiANGnmPilLM0lZywkoH26YdQ5C9KrdMwbb92dxxR2D+qEbxVlH36sjOual3txeETTbmCbcTTdQCkbrND7+hSaHNx4vmj05P8HT5TwgQXmp9U4Sp7BapRezRS5KCr12fYaoaDE5xS3Anq/F5ErJDVv5x2HoXhmXEdo=
+  - secure: XyR0p0arii92VSAjfhyLDBNZgeOR6eE1ROrha8JtR1z5LRyACNHcjx3yfsX31kEG0345H5MJ5MHqtWOOMYJkNLtmMjwHYl3kapYGx4dicMje0sNgDX/l2aNUFN/SxnXNUJbvKi3iHGBhvZjPCN3KkKHjzycWuE8rHWjeENS24fE=
+  - secure: LYstWpIEUVrUoVOrT6Lp6YC8pKOqAzbxSiw5WtUurFtyjlVLKc3xQI+Tn6Vf0Sn9IvUEZjIDTFPhfqx7GtEuiVH43cWdveFWDyiZ2s7ln2br1oFB5G+Jm73P4NPF+Y7hdlka1nthiTPda6J1LOfm3GQu0zbV63OS6F7urApX3jo=
+  - secure: i2l76kHVxv1ylCGlAOO5hpYdiis5lO33RPq6W/bOVMbNnTzrB+XW5sYuW7CCFeNDYiB3NFo26B31prZ3Lfvd5WzGTImEoIQmkd2xEUV1culPxHQ56FLSn3w8gxut7dM1om0uNyn3D5mg85GRhmkDP3D7vW914nPqaMcm/RVRMM4=
 before_install:
-- if [ "$TRAVIS_BRANCH" = "master" -a "$TRAVIS_PULL_REQUEST" = "false" ]; then openssl aes-256-cbc -K $encrypted_aa756c3a201c_key -iv $encrypted_aa756c3a201c_iv -in secrets.tar.enc -out secrets.tar -d; tar xvf secrets.tar; fi
+- if [[ "$TRAVIS_TAG" =~ ^v.+$ || (( "$TRAVIS_BRANCH" = "master" || "$TRAVIS_BRANCH"
+  = "develop" || "$TRAVIS_BRANCH" = "travis-test") && "$TRAVIS_PULL_REQUEST" = "false")  ]]
+  ; then SHOULD_PUBLISH=0; fi
+- if (( $SHOULD_PUBLISH == 0)) ; then openssl aes-256-cbc -K $encrypted_2e6278147cf7_key
+  -iv $encrypted_2e6278147cf7_iv -in secrets.tar.enc -out secrets.tar -d; tar xvf
+  secrets.tar; fi
 after_success:
-- if [ "$TRAVIS_BRANCH" = "master" -a "$TRAVIS_PULL_REQUEST" = "false" ]; then  sbt publishSigned; fi
-- if [[ "$TRAVIS_PULL_REQUEST" != "false" ]]; then bash <(curl -s https://codecov.io/bash); elif [ "$TRAVIS_BRANCH" = "master" ]; then bash <(curl -s https://codecov.io/bash); fi
+- if (( $SHOULD_PUBLISH == 0)) ; then  sbt ++$TRAVIS_SCALA_VERSION publishSigned;
+  fi
+- if [[ "$TRAVIS_PULL_REQUEST" != "false" ]]; then bash <(curl -s https://codecov.io/bash);
+  elif [[ "$TRAVIS_BRANCH" = "master" || "$TRAVIS_BRANCH" = "develop" ]]; then bash
+  <(curl -s https://codecov.io/bash); fi

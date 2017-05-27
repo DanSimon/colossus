@@ -5,62 +5,135 @@ import core._
 import testkit._
 import akka.util.ByteString
 
+import scala.concurrent.duration._
+
 
 
 class OutputControllerSpec extends ColossusSpec {
 
- import TestController.createController 
+  import TestController._
 
   "OutputController" must {
     "push a message" in {
-      val (endpoint, controller) = createController()
-      val data = ByteString("Hello World!")
-      val message = TestOutput(Source.one(DataBuffer(data)))
-      controller.testPush(message){_ must equal (OutputResult.Success)}
-      endpoint.expectOneWrite(data)
+      val endpoint = static()
+      val message = ByteString("Hello World!")
+      val p = endpoint.typedHandler.pPush(message)
+      p.isSet must equal(false)
+      endpoint.iterate()
+      endpoint.expectOneWrite(message)
+      p.isSuccess must equal(true)
 
     }
     "push multiple messages" in {
-      val (endpoint, controller) = createController()
+      val endpoint = static()
       val data = ByteString("Hello World!")
-      val message = TestOutput(Source.one(DataBuffer(data)))
-      controller.testPush(message){_ must equal (OutputResult.Success)}
-      endpoint.expectOneWrite(data)
-
-      val message2 = TestOutput(Source.one(DataBuffer(data)))
-      controller.testPush(message2){_ must equal (OutputResult.Success)}
-      endpoint.expectOneWrite(data)
+      val p1 = endpoint.typedHandler.pPush(data)
+      val p2 = endpoint.typedHandler.pPush(data)
+      endpoint.iterate()
+      endpoint.expectOneWrite(data ++ data)
+      p1.expectSuccess()
+      p2.expectSuccess()
 
     }
 
-    "drain output buffer on graceful disconnect" in {
-      val (endpoint, controller) = createController()
-      val data = ByteString(List.fill(endpoint.maxWriteSize + 1)("x").mkString)
-      val message = TestOutput(Source.one(DataBuffer(data)))
-      val data2 = ByteString("m2")
-      val message2 = TestOutput(Source.one(DataBuffer(data2)))
+    "push a streaming message" in {
+      val endpoint = stream()
+      val pieces = List("a", "b", "c").map{s => ByteString(s)}
+      val gen = new IteratorGenerator(pieces.map{DataBuffer(_)}.toIterator)
+      val message = TestOutput(gen)
+      val p = endpoint.typedHandler.pPush(message)
+      p.expectNoSet
+      endpoint.iterate() //this first iteration simply encodes the message and starts the pull
+      p.expectNoSet
+      endpoint.iterate() //this one should do the writes
+      endpoint.expectOneWrite(ByteString("abc"))
+      p.expectSuccess
+    }
 
-      controller.testPush(message){_ must equal (OutputResult.Success)}
-      controller.testPush(message2){_ must equal (OutputResult.Success)}
-      controller.testGracefulDisconnect()
+
+    "respect buffer soft overflow" in {
+      val endpoint = static()
+      val over = ByteString(List.fill(110)("a").mkString)
+      val next = ByteString("hey")
+      val p1 = endpoint.typedHandler.pPush(over)
+      val p2 = endpoint.typedHandler.pPush(next)
+      endpoint.iterate()
+      p1.expectSuccess()
+      p2.expectNoSet
+      endpoint.iterate()
+      p2.expectSuccess()
+    }
+
+    "respect pausing writes while writing" in {
+      val endpoint = static()
+      val data = ByteString("hello")
+      endpoint.typedHandler.testPush(data){ case _ => endpoint.typedHandler.testPause() }
+      val p = endpoint.typedHandler.pPush(data)
+      endpoint.iterate()
       endpoint.expectOneWrite(data)
-      endpoint.disconnectCalled must equal(false)
-      endpoint.clearBuffer()
-      endpoint.expectWrite(data2)
-      endpoint.disconnectCalled must equal(true)  
+      p.expectNoSet()
+      endpoint.typedHandler.testResume()
+      endpoint.iterate()
+      p.expectSuccess()
+    }
+
+    "not request a write when writes are paused" in {
+      val endpoint = static()
+      val data = ByteString("hello")
+      endpoint.writeReadyEnabled must equal(false)
+      endpoint.typedHandler.testPause()
+      val p = endpoint.typedHandler.pPush(data)
+      endpoint.writeReadyEnabled must equal(false)
+    }
+
+
+
+    "drain output buffer on disconnect" in {
+      val endpoint = static()
+      val over = ByteString(List.fill(110)("a").mkString)
+      val next = ByteString("hey")
+      val p1 = endpoint.typedHandler.pPush(over)
+      val p2 = endpoint.typedHandler.pPush(next)
+      endpoint.typedHandler.disconnect()
+      endpoint.workerProbe.expectNoMsg(100.milliseconds)
+      endpoint.iterate()
+      p1.expectSuccess()
+      p2.expectNoSet
+      endpoint.iterate()
+      p2.expectSuccess()
+      //final iterate is needed to do the disconnect check
+      endpoint.iterate()
+      endpoint.workerProbe.expectMsg(100.milliseconds, WorkerCommand.Disconnect(endpoint.id))
     }
 
     "timeout queued messages that haven't been sent" in {
-      val (endpoint, controller) = createController()
-      val data = ByteString(List.fill(endpoint.maxWriteSize + 1)("x").mkString)
-
-      val message = TestOutput(Source.one(DataBuffer(data)))
-      val message2 = TestOutput(Source.one(DataBuffer(data)))
-
-      controller.testPush(message){_ must equal (OutputResult.Success)}
-      controller.testPush(message2){_ must equal (OutputResult.Cancelled)}
-
+      val endpoint = static()
+      val p = endpoint.typedHandler.pPush(ByteString("wat"))
+      Thread.sleep(300)
+      endpoint.typedHandler.idleCheck(1.millisecond)
+      p.expectCancelled()
     }
+
+
+    "fail pending messages on connectionClosed while gracefully disconnecting"  in {
+      val endpoint = static()
+      val p = endpoint.typedHandler.pPush(ByteString("hello"))
+      endpoint.typedHandler.disconnect()
+      endpoint.disconnectCalled must equal(false)
+      p.expectNoSet()
+      endpoint.disrupt()
+      p.expectCancelled()
+    }
+
+    "not fail pending messages when connection disrupted" in {
+      val endpoint = static()
+      val p = endpoint.typedHandler.pPush(ByteString("hello"))
+      endpoint.disrupt()
+      p.expectNoSet()
+    }
+
+
+
   }
 
 

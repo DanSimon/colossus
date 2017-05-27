@@ -1,6 +1,7 @@
 package colossus
 package testkit
 
+import colossus.metrics.MetricSystem
 import core._
 
 import org.scalatest._
@@ -35,7 +36,7 @@ abstract class ColossusSpec(_system: ActorSystem) extends TestKit(_system) with 
    * @param f
    */
   def withIOSystem(f: IOSystem => Any) {
-    val sys = IOSystem("test-system-" + System.currentTimeMillis.toString, 2)
+    val sys = IOSystem("test-system-" + System.currentTimeMillis.toString, Some(2), MetricSystem.deadSystem)
     try {
       f(sys)
     } finally {
@@ -111,6 +112,15 @@ abstract class ColossusSpec(_system: ActorSystem) extends TestKit(_system) with 
     }
   }
 
+  def withServer(handler: ServerContext => ServerConnectionHandler)(op: ServerRef => Any) {
+    withIOSystem { implicit io =>
+      val server = Server.basic("test-server", TEST_PORT)(handler)
+      waitForServer(server)
+      op(server)
+      end(server)
+    }
+  }
+
   /**
    * Shuts down, and asserts that a Server has been terminated.
    * @param server
@@ -132,7 +142,7 @@ abstract class ColossusSpec(_system: ActorSystem) extends TestKit(_system) with 
     waitForServer(server)
     try {
       op
-    } finally {      
+    } finally {
       end(server)
     }
   }

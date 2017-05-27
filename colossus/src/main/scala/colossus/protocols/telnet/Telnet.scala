@@ -13,15 +13,15 @@ package object telnet {
   import scala.language.higherKinds
   //type Telnet[M[_, _]] = M[TelnetCommand, TelnetReply]
 
-  trait Telnet extends CodecDSL {
+  trait Telnet extends Protocol {
     type Input = TelnetCommand
     type Output = TelnetReply
   }
 
-  implicit object TelnetProvider extends CodecProvider[Telnet] {
+  implicit object TelnetProvider extends ServiceCodecProvider[Telnet] {
     def provideCodec() = TelnetServerCodec
 
-    def errorResponse(request: TelnetCommand, reason: Throwable) = TelnetReply(s"Error: $reason")
+    def errorResponse(error: ProcessingFailure[TelnetCommand]) = TelnetReply(s"Error: ${error.reason}")
   }
 
   case class TelnetCommand(args: List[String])
@@ -57,13 +57,13 @@ package object telnet {
           argBuilder = new StringBuilder
         }
       }
-          
+
 
       def result = TelnetCommand(args.reverse)
     }
 
     var builder: Builder = new Builder
-    
+
 
     def parse(data: DataBuffer): Option[TelnetCommand] = {
       var line: Option[TelnetCommand] = None
@@ -108,7 +108,7 @@ package object telnet {
           builder.argBuilder.append(next.toChar)
         }
       }
-      line        
+      line
     }
   }
 
@@ -117,7 +117,7 @@ package object telnet {
     val parser = new TelnetCommandParser
 
     def decode(data: DataBuffer): Option[DecodedResult[TelnetCommand]] = DecodedResult.static(parser.parse(data))
-    def encode(reply: TelnetReply): DataBuffer = DataBuffer(reply.bytes)
+    def encode(reply: TelnetReply): DataReader = DataBuffer(reply.bytes)
     def reset(){}
 
     def apply() = this

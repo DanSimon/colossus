@@ -15,7 +15,7 @@ import scala.concurrent.duration._
  * encode output messages.  There is no coupling between input and output
  * messages.  The service layer extends this layer to add request/response
  * semantics.
- * 
+ *
  * This example is a simple chat server built on the controller layer.  This example is largely
  * a motivator for cleaning up the controller API.  It should become simpler as
  * we improve the interface.
@@ -38,30 +38,29 @@ class ChatCodec extends Codec[ChatMessage, String]{
 
   def decode(data: DataBuffer): Option[DecodedResult[String]] = parser.parse(data).map{DecodedResult.Static(_)}
 
-  def encode(message: ChatMessage): DataReader = DataBuffer(ByteString(message.formatted))
+  def encode(message: ChatMessage)= DataBuffer(ByteString(message.formatted))
 
   def reset(){}
 
 }
-  
+
 class Broadcaster extends Actor {
   import Broadcaster._
 
-  case class Client(worker: ActorRef, id: Long)
 
-  val clients = collection.mutable.Set[Client]()
+  val clients = collection.mutable.Set[ActorRef]()
 
   def broadcast(message: ChatMessage) {
-    clients.foreach{case Client(worker, id) => worker ! WorkerCommand.Message(id, message)}
+    clients.foreach{_ ! message}
   }
 
   def receive = {
-    case ClientOpened(user, id) => {
-      clients += Client(sender, id)
+    case ClientOpened(user) => {
+      clients += sender()
       broadcast(Status(s"$user has joined"))
     }
-    case ClientClosed(user, id) => {
-      clients -= Client(sender, id)
+    case ClientClosed(user) => {
+      clients -= sender()
       broadcast(Status(s"$user has left"))
     }
     case m: ChatMessage => broadcast(m)
@@ -70,12 +69,15 @@ class Broadcaster extends Actor {
 
 object Broadcaster {
   sealed trait BroadcasterMessage
-  case class ClientOpened(user: String, id: Long) extends BroadcasterMessage
-  case class ClientClosed(user: String, id: Long) extends BroadcasterMessage
+  case class ClientOpened(user: String) extends BroadcasterMessage
+  case class ClientClosed(user: String) extends BroadcasterMessage
 }
 
-class ChatHandler(broadcaster: ActorRef) extends Controller[String, ChatMessage](new ChatCodec, ControllerConfig(50, 10.seconds)) with ServerConnectionHandler {
-  implicit lazy val sender = boundWorker.get.worker
+class ChatHandler(broadcaster: ActorRef, context: ServerContext)
+extends Controller[String, ChatMessage](new ChatCodec, ControllerConfig(50, 10.seconds), context.context)
+with ProxyActor with ServerConnectionHandler {
+
+  implicit val namespace = context.server.namespace
 
   sealed trait State
   object State {
@@ -91,11 +93,8 @@ class ChatHandler(broadcaster: ActorRef) extends Controller[String, ChatMessage]
     push(Status("Please enter your name")){_ => ()}
   }
 
-  def receivedMessage(message: Any,sender: akka.actor.ActorRef){
-    message match {
-      case c: ChatMessage => push(c){_ => ()}
-      case _ => {}
-    }
+  def receive = {
+    case c: ChatMessage => push(c){_ => ()}
   }
 
   def processMessage(message: String) {
@@ -104,7 +103,7 @@ class ChatHandler(broadcaster: ActorRef) extends Controller[String, ChatMessage]
         val user = message.split(" ")(0)
         currentState = LoggedIn(user)
         push(Status("Logged in :)")){_ => ()}
-        broadcaster ! Broadcaster.ClientOpened(user, id.get)
+        broadcaster ! Broadcaster.ClientOpened(user)
       }
       case LoggedIn(user) => {
         broadcaster ! Chat(user, message)
@@ -117,38 +116,27 @@ class ChatHandler(broadcaster: ActorRef) extends Controller[String, ChatMessage]
     currentState match {
       case LoggingIn => {}
       case LoggedIn(user) => {
-        broadcaster ! Broadcaster.ClientClosed(user, id.get)
+        broadcaster ! Broadcaster.ClientClosed(user)
       }
     }
   }
 
-  def shutdownRequest(){
-    push(Status("The server is shutting down, goodbye")){_ => ()}
-    gracefulDisconnect()
+  override def shutdown(){
+    push(Status("goodbye")){_ => ()}
+    super.shutdown()
   }
 
 
 
-}
-
-class ChatDelegator(server: ServerRef, worker: WorkerRef, broadcaster: ActorRef) extends Delegator(server, worker) {
-
-  def acceptNewConnection = Some(new ChatHandler(broadcaster))
 }
 
 object ChatExample {
 
   def start(port: Int)(implicit io: IOSystem): ServerRef = {
     val broadcaster = io.actorSystem.actorOf(Props[Broadcaster])
-    val echoConfig = ServerConfig(
-      name = "chat",
-      settings = ServerSettings(
-        port = port
-      ),
-      delegatorFactory = (server, worker) => new ChatDelegator(server, worker, broadcaster)
-    )
-    Server(echoConfig)
-  
+
+    Server.basic("chat", port)(context => new ChatHandler(broadcaster, context))
+
   }
 
 }
